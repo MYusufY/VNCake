@@ -1,0 +1,1483 @@
+#!/usr/bin/env python3
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+import argparse
+import sys
+import os
+import threading
+import json
+from pathlib import Path
+from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
+from werkzeug.security import generate_password_hash, check_password_hash
+import sqlite3
+import secrets
+import string
+import subprocess
+import psutil
+import time
+import signal
+import atexit
+import logging
+from datetime import datetime, timedelta
+import requests
+from captcha.image import ImageCaptcha
+import base64
+import io
+
+try:
+    from tunnelify import tunnel
+    TUNNELIFY_AVAILABLE = True
+except ImportError:
+    TUNNELIFY_AVAILABLE = False
+
+ASCII_ART = """
+             ████             ████
+          ████████           ████████
+        ███████████         ███████████
+       ██████████████     ██████████████
+     █████████████████   █████████████████
+    ███████████████████ ███████████████████
+   █████████████████████████████████████████
+   ██████████████              █████████████
+  █████████████████            ██████████████
+  ██████████████████           ██████████████
+  ████████████████████         ██████████████
+  ██████████████████████       ██████████████
+  ████████████████████████     ██████████████
+   █████████████████████████   █████████████
+   ███████████████████████████ █████████████
+    ████████████  █████████████████████████
+     ███████████   ███████████████████████
+       █████████     ███████████████████
+        ████████       ████████████████
+          ██████         ████████████
+             ███           ███████
+
+
+            VM Management Platform
+"""
+
+
+class VNCakeConfig:
+    def __init__(self):
+        self.config_file = "vncake_config.json"
+        self.defaults = {
+            "iso_path": "/root/agenticarch-host.iso",
+            "novnc_path": "noVNC",
+            "enable_captcha": True,
+            "tunnel_provider": "cloudflare",
+                        "enable_tunneling": False,
+                        "localtunnel_subdomain": "",
+            "vm_timeout": 1800,
+            "port_range_start": 5900,
+            "vnc_port_range_start": 6080,
+            "vm_memory": "4096",
+            "vm_cpus": "4",
+            "show_local_access": True,
+            "database": "vm_manager.db"
+        }
+        self.config = self.load_config()
+
+    def load_config(self):
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    loaded_config = json.load(f)
+                    return {**self.defaults, **loaded_config}
+        except Exception:
+            pass
+        return self.defaults.copy()
+
+    def save_config(self):
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(self.config, f, indent=2)
+        except Exception as e:
+            print(f"Failed to save config: {e}")
+
+    def get(self, key):
+        return self.config.get(key, self.defaults.get(key))
+
+    def set(self, key, value):
+        self.config[key] = value
+
+
+class VNCakeManager:
+    def __init__(self, config):
+        self.config = config
+        self.app = Flask(__name__, template_folder="templates")
+        self.app.secret_key = secrets.token_hex(32)
+        self.app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=24)
+
+        self.user_vms = {}
+        self.user_activity = {}
+        self.user_tunnels = {}
+        self.port_assignments = {}
+
+        self.setup_logging()
+        self.setup_routes()
+        self.setup_signal_handlers()
+
+    def setup_logging(self):
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s [%(levelname)s] %(message)s',
+            handlers=[
+                logging.FileHandler('vncake.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+
+    def setup_signal_handlers(self):
+        def signal_handler(signum, frame):
+            self.logger.info(f"Received termination signal {signum}")
+            self.cleanup_all_vms()
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        atexit.register(self.cleanup_all_vms)
+
+    def setup_routes(self):
+        @self.app.route('/')
+        def index():
+            if 'user_id' in session:
+                return redirect(url_for('dashboard'))
+            return redirect(url_for('login'))
+
+        @self.app.route('/login', methods=['GET', 'POST'])
+        def login():
+            if request.method == 'GET':
+                if self.config.get('enable_captcha'):
+                    captcha_text, captcha_img = self.generate_captcha()
+                    session['captcha'] = captcha_text
+                    return render_template("login.html",
+                                           captcha_text=captcha_text,
+                                           captcha_img=captcha_img,
+                                           enable_captcha=True)
+                else:
+                    return render_template("login.html", enable_captcha=False)
+
+            return self.handle_login()
+
+        @self.app.route('/signup', methods=['GET', 'POST'])
+        def signup():
+            if request.method == 'GET':
+                if self.config.get('enable_captcha'):
+                    captcha_text, captcha_img = self.generate_captcha()
+                    session['captcha'] = captcha_text
+                    return render_template("signup.html",
+                                           captcha_text=captcha_text,
+                                           captcha_img=captcha_img,
+                                           enable_captcha=True)
+                else:
+                    return render_template(
+                        "signup.html", enable_captcha=False)
+
+            return self.handle_signup()
+
+        @self.app.route('/dashboard')
+        def dashboard():
+            return self.handle_dashboard()
+
+        @self.app.route('/start_vm', methods=['POST'])
+        def start_vm():
+            return self.handle_start_vm()
+
+        @self.app.route('/stop_vm', methods=['POST'])
+        def stop_vm():
+            return self.handle_stop_vm()
+
+        @self.app.route('/heartbeat', methods=['POST'])
+        def heartbeat():
+            return self.handle_heartbeat()
+
+        @self.app.route('/logout')
+        def logout():
+            return self.handle_logout()
+
+    def init_db(self):
+        conn = sqlite3.connect(self.config.get('database'))
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS users
+             (id INTEGER PRIMARY KEY AUTOINCREMENT,
+              email TEXT UNIQUE NOT NULL,
+              password_hash TEXT NOT NULL,
+              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS vm_sessions
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      user_id INTEGER,
+                      vnc_port INTEGER,
+                      novnc_port INTEGER,
+                      qemu_pid INTEGER,
+                      novnc_pid INTEGER,
+                      tunnel_url TEXT,
+                      last_activity TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      FOREIGN KEY (user_id) REFERENCES users (id))''')
+
+        try:
+            c.execute("ALTER TABLE vm_sessions ADD COLUMN tunnel_url TEXT")
+            self.logger.info("Added tunnel_url column to vm_sessions table")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                self.logger.warning(f"Database migration issue: {e}")
+
+        conn.commit()
+        conn.close()
+        self.logger.info("Database initialized")
+
+    def get_db_connection(self):
+        conn = sqlite3.connect(self.config.get('database'))
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def generate_captcha(self):
+        image = ImageCaptcha(width=280, height=90)
+        captcha_text = ''.join(
+            secrets.choice(
+                string.ascii_uppercase +
+                string.digits) for _ in range(6))
+        data = image.generate(captcha_text)
+        img_base64 = base64.b64encode(data.getvalue()).decode()
+        return captcha_text, img_base64
+
+    def get_free_ports(self):
+        used_ports = set()
+        try:
+            for proc in psutil.process_iter(['pid', 'name']):
+                try:
+                    connections = proc.connections()
+                    for conn in connections:
+                        if conn.laddr:
+                            used_ports.add(conn.laddr.port)
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+        except BaseException:
+            pass
+
+        vnc_port = self.config.get('port_range_start')
+        while vnc_port in used_ports or vnc_port in self.port_assignments.values():
+            vnc_port += 1
+
+        novnc_port = self.config.get('vnc_port_range_start')
+        while novnc_port in used_ports or novnc_port in [
+                v['novnc_port'] for v in self.user_vms.values()]:
+            novnc_port += 1
+
+        return vnc_port, novnc_port
+
+    def wait_for_vnc_ready(self, vnc_port, timeout=120):
+        import socket
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.settimeout(1)
+                    result = sock.connect_ex(('127.0.0.1', vnc_port))
+                    if result == 0:
+                        self.logger.info(
+                            f"VNC server ready on port {vnc_port}")
+                        return True
+            except BaseException:
+                pass
+            time.sleep(2)
+        return False
+
+    def start_vm_for_user(self, user_id):
+        if user_id in self.user_vms:
+            self.logger.warning(
+                f"VM start attempt for user {user_id} - VM already running")
+            return self.user_vms[user_id]
+
+        vnc_port, novnc_port = self.get_free_ports()
+        self.logger.info(
+            f"Starting VM for user {user_id} - VNC port: {vnc_port}, noVNC port: {novnc_port}")
+
+        qemu_cmd = [
+            'qemu-system-x86_64',
+            '-m',
+            self.config.get('vm_memory'),
+            '-smp',
+            self.config.get('vm_cpus'),
+            '-enable-kvm',
+            '-cdrom',
+            self.config.get('iso_path'),
+            '-boot',
+            'd',
+            '-vga',
+            'std',
+            '-vnc',
+            f'127.0.0.1:{
+                vnc_port -
+                self.config.get("port_range_start")}',
+            '-name',
+            f'VNCake-User{user_id}']
+
+        try:
+            qemu_proc = subprocess.Popen(
+                qemu_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+
+            self.logger.info(
+                f"Waiting for QEMU to be ready on VNC port {vnc_port}...")
+            if not self.wait_for_vnc_ready(vnc_port):
+                self.logger.error(
+                    f"QEMU failed to start properly for user {user_id}")
+                qemu_proc.terminate()
+                return None
+
+            novnc_cmd = [
+                f'{self.config.get("novnc_path")}/utils/novnc_proxy',
+                '--vnc', f'127.0.0.1:{vnc_port}',
+                '--listen', f'127.0.0.1:{novnc_port}'
+            ]
+
+            novnc_proc = subprocess.Popen(
+                novnc_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+
+            time.sleep(2)
+
+            tunnel_url = None
+            tunnel_proc = None
+
+            if self.config.get('enable_tunneling') and TUNNELIFY_AVAILABLE:
+                try:
+                    self.logger.info(
+                        f"Creating tunnel for user {user_id}...")
+                    provider = self.config.get('tunnel_provider')
+
+                    if provider == "localtunnel":
+                        subdomain = self.config.get('localtunnel_subdomain')
+                        if subdomain:
+                            import random
+                            random_suffix = ''.join(
+                                random.choices('0123456789abcdef', k=8))
+                            custom_subdomain = f"{subdomain}-{random_suffix}"
+                            base_tunnel_url, _ = tunnel(
+                                novnc_port, "localtunnel", custom_subdomain)
+                        else:
+                            base_tunnel_url, _ = tunnel(
+                                novnc_port, "localtunnel")
+                    else:
+                        base_tunnel_url, tunnel_proc = tunnel(
+                            novnc_port, "cloudflare")
+
+                    tunnel_url = f"{base_tunnel_url}/vnc.html?autoconnect=true&resize=scale"
+                    if provider == "cloudflare":
+                        self.user_tunnels[user_id] = tunnel_proc
+                    self.logger.info(
+                        f"Tunnel created for user {user_id}: {tunnel_url}")
+                except Exception as e:
+                    self.logger.error(
+                        f"Failed to create tunnel for user {user_id}: {e}")
+
+            vm_info = {
+                'vnc_port': vnc_port,
+                'novnc_port': novnc_port,
+                'qemu_pid': qemu_proc.pid,
+                'novnc_pid': novnc_proc.pid,
+                'qemu_proc': qemu_proc,
+                'novnc_proc': novnc_proc,
+                'tunnel_url': tunnel_url,
+                'tunnel_proc': tunnel_proc
+            }
+
+            self.user_vms[user_id] = vm_info
+            self.user_activity[user_id] = time.time()
+
+            conn = self.get_db_connection()
+            conn.execute(
+                '''INSERT INTO vm_sessions (user_id, vnc_port, novnc_port, qemu_pid, novnc_pid, tunnel_url)
+                            VALUES (?, ?, ?, ?, ?, ?)''',
+                (user_id,
+                 vnc_port,
+                 novnc_port,
+                 qemu_proc.pid,
+                 novnc_proc.pid,
+                 tunnel_url))
+            conn.commit()
+            conn.close()
+
+            self.logger.info(
+                f"VM successfully started for user {user_id} - QEMU PID: {
+                    qemu_proc.pid}, noVNC PID: {
+                    novnc_proc.pid}")
+            return vm_info
+        except Exception as e:
+            self.logger.error(
+                f"Failed to start VM for user {user_id}: {e}")
+            return None
+
+    def kill_vm_for_user(self, user_id):
+        if user_id not in self.user_vms:
+            return False
+
+        vm_info = self.user_vms[user_id]
+        self.logger.info(
+            f"Killing VM for user {user_id} - QEMU PID: {
+                vm_info['qemu_pid']}, noVNC PID: {
+                vm_info['novnc_pid']}")
+
+        try:
+            if vm_info['qemu_proc'].poll() is None:
+                vm_info['qemu_proc'].terminate()
+                vm_info['qemu_proc'].wait(timeout=5)
+        except BaseException:
+            try:
+                os.kill(vm_info['qemu_pid'], signal.SIGTERM)
+            except BaseException:
+                pass
+
+        try:
+            if vm_info['novnc_proc'].poll() is None:
+                vm_info['novnc_proc'].terminate()
+                vm_info['novnc_proc'].wait(timeout=5)
+        except BaseException:
+            try:
+                os.kill(vm_info['novnc_pid'], signal.SIGTERM)
+            except BaseException:
+                pass
+
+        if user_id in self.user_tunnels and self.user_tunnels[user_id]:
+            try:
+                self.user_tunnels[user_id].terminate()
+                del self.user_tunnels[user_id]
+            except BaseException:
+                pass
+
+        del self.user_vms[user_id]
+        if user_id in self.user_activity:
+            del self.user_activity[user_id]
+
+        conn = self.get_db_connection()
+        conn.execute('DELETE FROM vm_sessions WHERE user_id = ?', (user_id,))
+        conn.commit()
+        conn.close()
+
+        self.logger.info(f"VM killed for user {user_id}")
+        return True
+
+    def cleanup_all_vms(self):
+        self.logger.info("Application shutdown: Cleaning up all VMs...")
+        for user_id in list(self.user_vms.keys()):
+            self.kill_vm_for_user(user_id)
+        self.logger.info("VM cleanup completed")
+
+    def cleanup_inactive_vms(self):
+        while True:
+            current_time = time.time()
+            inactive_users = []
+
+            for user_id, last_activity in self.user_activity.items():
+                if current_time - \
+                        last_activity > self.config.get('vm_timeout'):
+                    inactive_users.append(user_id)
+
+            for user_id in inactive_users:
+                self.logger.info(
+                    f"VM timeout for user {user_id} - killing due to inactivity")
+                self.kill_vm_for_user(user_id)
+
+            time.sleep(60)
+
+    def handle_login(self):
+        email = request.form['email']
+        password = request.form['password']
+
+        if self.config.get('enable_captcha'):
+            captcha_input = request.form['captcha']
+            captcha_stored = session.get('captcha', '')
+
+            if captcha_input.upper() != captcha_stored.upper():
+                self.logger.warning(
+                    f"Invalid CAPTCHA for login attempt: {email}")
+                captcha_text, captcha_img = self.generate_captcha()
+                session['captcha'] = captcha_text
+                return render_template("login.html",
+                                       error='Invalid CAPTCHA',
+                                       captcha_text=captcha_text,
+                                       captcha_img=captcha_img,
+                                       enable_captcha=True)
+
+        conn = self.get_db_connection()
+        user = conn.execute(
+            'SELECT * FROM users WHERE email = ?', (email,)).fetchone()
+        conn.close()
+
+        if user and check_password_hash(user['password_hash'], password):
+            session['user_id'] = user['id']
+            session['user_email'] = user['email']
+            session.permanent = True
+            self.logger.info(
+                f"Successful login for user ID {
+                    user['id']} ({email})")
+            return redirect(url_for('dashboard'))
+        else:
+            self.logger.warning(f"Failed login attempt for email: {email}")
+            if self.config.get('enable_captcha'):
+                captcha_text, captcha_img = self.generate_captcha()
+                session['captcha'] = captcha_text
+                return render_template("login.html",
+                                       error='Invalid credentials',
+                                       captcha_text=captcha_text,
+                                       captcha_img=captcha_img,
+                                       enable_captcha=True)
+            else:
+                return render_template("login.html",
+                                       error='Invalid credentials',
+                                       enable_captcha=False)
+
+    def handle_signup(self):
+        email = request.form['email']
+        password = request.form['password']
+        confirm_password = request.form['confirm_password']
+
+        if self.config.get('enable_captcha'):
+            captcha_input = request.form['captcha']
+            captcha_stored = session.get('captcha', '')
+
+            if captcha_input.upper() != captcha_stored.upper():
+                self.logger.warning(
+                    f"Invalid CAPTCHA for signup attempt: {email}")
+                captcha_text, captcha_img = self.generate_captcha()
+                session['captcha'] = captcha_text
+                return render_template("signup.html",
+                                       error='Invalid CAPTCHA',
+                                       captcha_text=captcha_text,
+                                       captcha_img=captcha_img,
+                                       enable_captcha=True)
+
+        if password != confirm_password:
+            if self.config.get('enable_captcha'):
+                captcha_text, captcha_img = self.generate_captcha()
+                session['captcha'] = captcha_text
+                return render_template("signup.html",
+                                       error='Passwords do not match',
+                                       captcha_text=captcha_text,
+                                       captcha_img=captcha_img,
+                                       enable_captcha=True)
+            else:
+                return render_template("signup.html",
+                                       error='Passwords do not match',
+                                       enable_captcha=False)
+
+        if len(password) < 6:
+            error_msg = 'Password must be at least 6 characters'
+            if self.config.get('enable_captcha'):
+                captcha_text, captcha_img = self.generate_captcha()
+                session['captcha'] = captcha_text
+                return render_template("signup.html",
+                                       error=error_msg,
+                                       captcha_text=captcha_text,
+                                       captcha_img=captcha_img,
+                                       enable_captcha=True)
+            else:
+                return render_template("signup.html",
+                                       error=error_msg,
+                                       enable_captcha=False)
+
+        conn = self.get_db_connection()
+        existing_user = conn.execute(
+            'SELECT id FROM users WHERE email = ?', (email,)).fetchone()
+
+        if existing_user:
+            conn.close()
+            self.logger.warning(f"Signup attempt with existing email: {email}")
+            error_msg = 'Email already exists'
+            if self.config.get('enable_captcha'):
+                captcha_text, captcha_img = self.generate_captcha()
+                session['captcha'] = captcha_text
+                return render_template("signup.html",
+                                       error=error_msg,
+                                       captcha_text=captcha_text,
+                                       captcha_img=captcha_img,
+                                       enable_captcha=True)
+            else:
+                return render_template("signup.html",
+                                       error=error_msg,
+                                       enable_captcha=False)
+
+        password_hash = generate_password_hash(password)
+        conn.execute(
+            '''INSERT INTO users (email, password_hash)
+                        VALUES (?, ?)''', (email, password_hash))
+        conn.commit()
+        conn.close()
+
+        self.logger.info(f"New user registered: {email}")
+
+        success_msg = 'Account created! You can now login.'
+        if self.config.get('enable_captcha'):
+            captcha_text, captcha_img = self.generate_captcha()
+            session['captcha'] = captcha_text
+            return render_template("signup.html",
+                                   success=success_msg,
+                                   captcha_text=captcha_text,
+                                   captcha_img=captcha_img,
+                                   enable_captcha=True)
+        else:
+            return render_template("signup.html",
+                                   success=success_msg,
+                                   enable_captcha=False)
+
+    def handle_dashboard(self):
+        if 'user_id' not in session:
+            return redirect(url_for('login'))
+
+        user_id = session['user_id']
+        user_email = session['user_email']
+
+        vm_running = user_id in self.user_vms
+        vnc_port = None
+        novnc_port = None
+        tunnel_url = None
+
+        if vm_running:
+            vm_info = self.user_vms[user_id]
+            vnc_port = vm_info['vnc_port']
+            novnc_port = vm_info['novnc_port']
+            tunnel_url = vm_info.get('tunnel_url')
+            self.user_activity[user_id] = time.time()
+            self.logger.info(
+                f"Dashboard access for user {user_id} - VM running on ports VNC:{vnc_port} noVNC:{novnc_port}")
+        else:
+            self.logger.info(
+                f"Dashboard access for user {user_id} - no VM running")
+
+        return render_template(
+			"dashboard.html",
+			user_email=user_email,
+			vm_running=vm_running,
+			vnc_port=vnc_port,
+			novnc_port=novnc_port,
+			tunnel_url=tunnel_url,
+			active_users_count=len(self.user_vms),
+			enable_tunneling=self.config.get('enable_tunneling'),
+			show_local_access=self.config.get('show_local_access'))
+
+    def handle_start_vm(self):
+        if 'user_id' not in session:
+            return jsonify({'success': False, 'error': 'Not logged in'})
+
+        user_id = session['user_id']
+
+        if user_id in self.user_vms:
+            self.logger.info(
+                f"VM start request for user {user_id} - already running")
+            return jsonify({'success': False, 'error': 'VM already running'})
+
+        self.logger.info(f"Starting VM for user {user_id}")
+        vm_info = self.start_vm_for_user(user_id)
+        if vm_info:
+            return jsonify({
+                'success': True,
+                'vnc_port': vm_info['vnc_port'],
+                'novnc_port': vm_info['novnc_port'],
+                'tunnel_url': vm_info.get('tunnel_url')
+            })
+        else:
+            return jsonify({'success': False, 'error': 'Failed to start VM'})
+
+    def handle_stop_vm(self):
+        if 'user_id' not in session:
+            return jsonify({'success': False, 'error': 'Not logged in'})
+
+        user_id = session['user_id']
+
+        self.logger.info(f"VM stop request for user {user_id}")
+        if self.kill_vm_for_user(user_id):
+            return jsonify({'success': True})
+        else:
+            return jsonify({'success': False, 'error': 'No VM running'})
+
+    def handle_heartbeat(self):
+        if 'user_id' not in session:
+            return jsonify({'success': False})
+
+        user_id = session['user_id']
+        if user_id in self.user_activity:
+            self.user_activity[user_id] = time.time()
+
+        return jsonify({'success': True})
+
+    def handle_logout(self):
+        if 'user_id' in session:
+            user_id = session['user_id']
+            user_email = session.get('user_email', 'Unknown')
+            self.logger.info(f"User {user_id} ({user_email}) logging out")
+            self.kill_vm_for_user(user_id)
+
+        session.clear()
+        return redirect(url_for('login'))
+
+    def run(self, host='0.0.0.0', port=5000, debug=False):
+        self.logger.info("VNCake Manager starting up...")
+        self.init_db()
+
+        cleanup_thread = threading.Thread(
+            target=self.cleanup_inactive_vms, daemon=True)
+        cleanup_thread.start()
+        self.logger.info("VM cleanup thread started")
+
+        self.logger.info(
+            f"VNCake Manager ready - Access at http://localhost:{port}")
+        if self.config.get('enable_tunneling') and not TUNNELIFY_AVAILABLE:
+            self.logger.warning(
+                "Tunneling enabled but tunnelify library not available")
+
+        self.app.run(host=host, port=port, debug=debug)
+
+
+class VNCakeGUI:
+    def __init__(self):
+        self.config = VNCakeConfig()
+        self.manager = None
+        self.server_thread = None
+        self.root = tk.Tk()
+        self.setup_gui()
+
+    def setup_gui(self):
+        self.root.title("VNCake Manager - Configuration & Control")
+        self.root.geometry("800x900")
+        self.root.resizable(True, True)
+
+        style = ttk.Style()
+        style.theme_use('clam')
+
+        main_frame = ttk.Frame(self.root, padding="20")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        header_frame = ttk.Frame(main_frame)
+        header_frame.pack(fill=tk.X, pady=(0, 20))
+
+        logo_image = tk.PhotoImage(file="static/vncake.png")
+        logo_label = tk.Label(header_frame, image=logo_image)
+        logo_label.image = logo_image
+        logo_label.pack(side=tk.LEFT)
+
+        title_label = tk.Label(
+            header_frame, text="VNCake Dashboard", font=(
+                "Arial", 18, "bold"))
+        title_label.pack(side=tk.LEFT, padx=(10, 0))
+
+        notebook = ttk.Notebook(main_frame)
+        notebook.pack(fill=tk.BOTH, expand=True)
+
+        config_frame = ttk.Frame(notebook, padding="20")
+        notebook.add(config_frame, text="Configuration")
+
+        control_frame = ttk.Frame(notebook, padding="20")
+        notebook.add(control_frame, text="Server Control")
+
+        logs_frame = ttk.Frame(notebook, padding="20")
+        notebook.add(logs_frame, text="Logs")
+
+        self.setup_config_tab(config_frame)
+        self.setup_control_tab(control_frame)
+        self.setup_logs_tab(logs_frame)
+
+    def setup_config_tab(self, parent):
+        canvas = tk.Canvas(parent)
+        scrollbar = ttk.Scrollbar(
+            parent, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        paths_label = ttk.Label(scrollable_frame, text="Paths Configuration",
+                                font=("Arial", 14, "bold"))
+        paths_label.pack(anchor=tk.W, pady=(0, 10))
+
+        iso_frame = ttk.Frame(scrollable_frame)
+        iso_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(iso_frame, text="ISO Path:").pack(side=tk.LEFT)
+        self.iso_path_var = tk.StringVar(value=self.config.get('iso_path'))
+        iso_entry = ttk.Entry(
+            iso_frame,
+            textvariable=self.iso_path_var,
+            width=50)
+        iso_entry.pack(side=tk.LEFT, padx=(10, 5), expand=True, fill=tk.X)
+        ttk.Button(iso_frame, text="Browse", command=lambda: self.browse_file(
+            self.iso_path_var, "ISO files", "*.iso")).pack(side=tk.RIGHT)
+
+        novnc_frame = ttk.Frame(scrollable_frame)
+        novnc_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(novnc_frame, text="noVNC Path:").pack(side=tk.LEFT)
+        self.novnc_path_var = tk.StringVar(value=self.config.get('novnc_path'))
+        novnc_entry = ttk.Entry(
+            novnc_frame,
+            textvariable=self.novnc_path_var,
+            width=50)
+        novnc_entry.pack(side=tk.LEFT, padx=(10, 5), expand=True, fill=tk.X)
+        ttk.Button(
+            novnc_frame,
+            text="Browse",
+            command=lambda: self.browse_directory(
+                self.novnc_path_var)).pack(
+            side=tk.RIGHT)
+
+        ttk.Separator(
+            scrollable_frame,
+            orient='horizontal').pack(
+            fill=tk.X,
+            pady=20)
+
+        features_label = ttk.Label(scrollable_frame, text="Features",
+                                   font=("Arial", 14, "bold"))
+        features_label.pack(anchor=tk.W, pady=(0, 10))
+
+        self.captcha_var = tk.BooleanVar(
+            value=self.config.get('enable_captcha'))
+        ttk.Checkbutton(scrollable_frame, text="Enable CAPTCHA",
+                        variable=self.captcha_var).pack(anchor=tk.W, pady=2)
+
+        self.tunneling_var = tk.BooleanVar(
+    value=self.config.get('enable_tunneling'))
+        tunnel_frame = ttk.Frame(scrollable_frame)
+        tunnel_frame.pack(fill=tk.X, pady=2)
+        ttk.Checkbutton(
+            tunnel_frame,
+            text="Enable Tunneling",
+            variable=self.tunneling_var).pack(
+            side=tk.LEFT)
+        if not TUNNELIFY_AVAILABLE:
+            ttk.Label(
+                tunnel_frame,
+                text="(tunnelify not installed)",
+                foreground="red").pack(
+                side=tk.LEFT,
+                padx=(
+                        10,
+                        0))
+
+        tunnel_provider_frame = ttk.Frame(scrollable_frame)
+        tunnel_provider_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(
+            tunnel_provider_frame,
+            text="Tunnel Provider:").pack(
+            side=tk.LEFT)
+        self.tunnel_provider_var = tk.StringVar(
+            value=self.config.get('tunnel_provider'))
+        provider_combo = ttk.Combobox(
+            tunnel_provider_frame,
+            textvariable=self.tunnel_provider_var,
+            values=[
+                    "cloudflare",
+                        "localtunnel"],
+            state="readonly",
+            width=15)
+        provider_combo.pack(side=tk.LEFT, padx=(10, 0))
+        provider_combo.bind(
+            "<<ComboboxSelected>>",
+                self.on_provider_change)
+
+        self.subdomain_frame = ttk.Frame(scrollable_frame)
+        self.subdomain_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(
+            self.subdomain_frame,
+            text="Localtunnel Subdomain:").pack(
+            side=tk.LEFT)
+        self.subdomain_var = tk.StringVar(
+            value=self.config.get('localtunnel_subdomain'))
+        ttk.Entry(
+            self.subdomain_frame,
+            textvariable=self.subdomain_var,
+            width=20).pack(
+            side=tk.LEFT,
+            padx=(
+                    10,
+                    0))
+        ttk.Label(
+            self.subdomain_frame,
+            text="(leave blank for random)",
+            foreground="gray").pack(
+            side=tk.LEFT,
+            padx=(
+                    10,
+                    0))
+
+        self.update_subdomain_visibility()
+
+        self.local_access_var = tk.BooleanVar(
+            value=self.config.get('show_local_access'))
+        ttk.Checkbutton(
+            scrollable_frame,
+            text="Show Local Access Button",
+            variable=self.local_access_var).pack(
+            anchor=tk.W,
+            pady=2)
+
+        ttk.Separator(
+            scrollable_frame,
+            orient='horizontal').pack(
+            fill=tk.X,
+            pady=20)
+
+        vm_label = ttk.Label(scrollable_frame, text="VM Configuration",
+                             font=("Arial", 14, "bold"))
+        vm_label.pack(anchor=tk.W, pady=(0, 10))
+
+        memory_frame = ttk.Frame(scrollable_frame)
+        memory_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(memory_frame, text="VM Memory (MB):").pack(side=tk.LEFT)
+        self.memory_var = tk.StringVar(value=self.config.get('vm_memory'))
+        ttk.Entry(
+            memory_frame,
+            textvariable=self.memory_var,
+            width=10).pack(
+            side=tk.LEFT,
+            padx=(
+                10,
+                0))
+
+        cpus_frame = ttk.Frame(scrollable_frame)
+        cpus_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(cpus_frame, text="VM CPUs:").pack(side=tk.LEFT)
+        self.cpus_var = tk.StringVar(value=self.config.get('vm_cpus'))
+        ttk.Entry(
+            cpus_frame,
+            textvariable=self.cpus_var,
+            width=10).pack(
+            side=tk.LEFT,
+            padx=(
+                10,
+                0))
+
+        timeout_frame = ttk.Frame(scrollable_frame)
+        timeout_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(
+            timeout_frame,
+            text="VM Timeout (seconds):").pack(
+            side=tk.LEFT)
+        self.timeout_var = tk.StringVar(
+            value=str(self.config.get('vm_timeout')))
+        ttk.Entry(
+            timeout_frame,
+            textvariable=self.timeout_var,
+            width=10).pack(
+            side=tk.LEFT,
+            padx=(
+                10,
+                0))
+
+        ttk.Separator(
+            scrollable_frame,
+            orient='horizontal').pack(
+            fill=tk.X,
+            pady=20)
+
+        network_label = ttk.Label(
+            scrollable_frame,
+            text="Network Configuration",
+            font=(
+                "Arial",
+                14,
+                "bold"))
+        network_label.pack(anchor=tk.W, pady=(0, 10))
+
+        port_start_frame = ttk.Frame(scrollable_frame)
+        port_start_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(
+            port_start_frame,
+            text="Port Range Start:").pack(
+            side=tk.LEFT)
+        self.port_start_var = tk.StringVar(
+            value=str(self.config.get('port_range_start')))
+        ttk.Entry(
+            port_start_frame,
+            textvariable=self.port_start_var,
+            width=10).pack(
+            side=tk.LEFT,
+            padx=(
+                10,
+                0))
+
+        vnc_port_start_frame = ttk.Frame(scrollable_frame)
+        vnc_port_start_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(
+            vnc_port_start_frame,
+            text="VNC Port Range Start:").pack(
+            side=tk.LEFT)
+        self.vnc_port_start_var = tk.StringVar(
+            value=str(self.config.get('vnc_port_range_start')))
+        ttk.Entry(
+            vnc_port_start_frame,
+            textvariable=self.vnc_port_start_var,
+            width=10).pack(
+            side=tk.LEFT,
+            padx=(
+                10,
+                0))
+
+        ttk.Separator(
+            scrollable_frame,
+            orient='horizontal').pack(
+            fill=tk.X,
+            pady=20)
+
+        save_frame = ttk.Frame(scrollable_frame)
+        save_frame.pack(fill=tk.X, pady=20)
+        ttk.Button(save_frame, text="Save Configuration",
+                   command=self.save_config).pack(side=tk.RIGHT)
+        ttk.Button(save_frame, text="Reset to Defaults",
+                   command=self.reset_config).pack(side=tk.RIGHT, padx=(0, 10))
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+    def setup_control_tab(self, parent):
+        status_frame = ttk.LabelFrame(
+            parent, text="Server Status", padding="15")
+        status_frame.pack(fill=tk.X, pady=(0, 20))
+
+        self.status_label = ttk.Label(status_frame, text="Server: Stopped",
+                                      font=("Arial", 12, "bold"))
+        self.status_label.pack(anchor=tk.W)
+
+        controls_frame = ttk.LabelFrame(parent, text="Controls", padding="15")
+        controls_frame.pack(fill=tk.X, pady=(0, 20))
+
+        button_frame = ttk.Frame(controls_frame)
+        button_frame.pack(fill=tk.X)
+
+        self.start_button = ttk.Button(
+            button_frame,
+            text="Start Server",
+            command=self.start_server,
+            state=tk.NORMAL)
+        self.start_button.pack(side=tk.LEFT, padx=(0, 10))
+
+        self.stop_button = ttk.Button(
+            button_frame,
+            text="Stop Server",
+            command=self.stop_server,
+            state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT, padx=(0, 10))
+
+        ttk.Button(button_frame, text="Open Web Interface",
+                   command=self.open_web_interface).pack(side=tk.LEFT)
+
+        ttk.Button(
+            button_frame,
+            text="Refresh Info",
+            command=self.update_info_display).pack(
+            side=tk.LEFT,
+            padx=(
+                10,
+                0))
+
+        info_frame = ttk.LabelFrame(
+            parent, text="Server Information", padding="15")
+        info_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.info_text = scrolledtext.ScrolledText(
+            info_frame, height=15, state=tk.DISABLED)
+        self.info_text.pack(fill=tk.BOTH, expand=True)
+
+        self.update_info_display()
+
+    def setup_logs_tab(self, parent):
+        log_frame = ttk.LabelFrame(
+            parent, text="Application Logs", padding="15")
+        log_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.log_text = scrolledtext.ScrolledText(
+            log_frame, height=25, state=tk.DISABLED)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+
+        button_frame = ttk.Frame(log_frame)
+        button_frame.pack(fill=tk.X, pady=(10, 0))
+
+        ttk.Button(button_frame, text="Clear Logs",
+                   command=self.clear_logs).pack(side=tk.LEFT)
+        ttk.Button(button_frame, text="Refresh",
+                   command=self.refresh_logs).pack(side=tk.LEFT, padx=(10, 0))
+
+        self.refresh_logs()
+
+    def browse_file(self, var, title, filetypes):
+        filename = filedialog.askopenfilename(
+            title=f"Select {title}", filetypes=[
+                (title, filetypes), ("All files", "*.*")])
+        if filename:
+            var.set(filename)
+
+    def browse_directory(self, var):
+        directory = filedialog.askdirectory(title="Select noVNC Directory")
+        if directory:
+            var.set(directory)
+
+    def save_config(self):
+        try:
+            self.config.set('iso_path', self.iso_path_var.get())
+            self.config.set('novnc_path', self.novnc_path_var.get())
+            self.config.set('enable_captcha', self.captcha_var.get())
+            self.config.set('enable_tunneling', self.tunneling_var.get())
+            self.config.set('tunnel_provider', self.tunnel_provider_var.get())
+            self.config.set('localtunnel_subdomain', self.subdomain_var.get())
+            self.config.set('show_local_access', self.local_access_var.get())
+            self.config.set('vm_memory', self.memory_var.get())
+            self.config.set('vm_cpus', self.cpus_var.get())
+            self.config.set('vm_timeout', int(self.timeout_var.get()))
+            self.config.set('port_range_start', int(self.port_start_var.get()))
+            self.config.set('vnc_port_range_start', int(self.vnc_port_start_var.get()))
+
+            self.config.save_config()
+            messagebox.showinfo("Success", "Configuration saved successfully!")
+            self.update_info_display()
+        except ValueError as e:
+            messagebox.showerror("Error", f"Invalid configuration values: {e}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save configuration: {e}")
+
+    def reset_config(self):
+        if messagebox.askyesno(
+            "Reset Configuration",
+                "Are you sure you want to reset to default values?"):
+            self.config.config = self.config.defaults.copy()
+            self.load_config_to_gui()
+            messagebox.showinfo("Reset", "Configuration reset to defaults!")
+
+    def load_config_to_gui(self):
+        self.iso_path_var.set(self.config.get('iso_path'))
+        self.novnc_path_var.set(self.config.get('novnc_path'))
+        self.captcha_var.set(self.config.get('enable_captcha'))
+        self.tunneling_var.set(self.config.get('enable_tunneling'))
+        self.local_access_var.set(self.config.get('show_local_access'))
+        self.memory_var.set(self.config.get('vm_memory'))
+        self.cpus_var.set(self.config.get('vm_cpus'))
+        self.timeout_var.set(str(self.config.get('vm_timeout')))
+        self.port_start_var.set(str(self.config.get('port_range_start')))
+        self.tunnel_provider_var.set(self.config.get('tunnel_provider'))
+        self.subdomain_var.set(self.config.get('localtunnel_subdomain'))
+        self.update_subdomain_visibility()
+        self.vnc_port_start_var.set(str(self.config.get('vnc_port_range_start')))
+
+    def start_server(self):
+        try:
+            if not os.path.exists(self.config.get('iso_path')):
+                messagebox.showerror("Error", "ISO file not found!")
+                return
+
+            if not os.path.exists(self.config.get('novnc_path')):
+                messagebox.showerror("Error", "noVNC directory not found!")
+                return
+
+            self.manager = VNCakeManager(self.config)
+            self.server_thread = threading.Thread(
+                target=self.manager.run, daemon=True)
+            self.server_thread.start()
+
+            self.start_button.config(state=tk.DISABLED)
+            self.stop_button.config(state=tk.NORMAL)
+            self.status_label.config(text="Server: Running")
+
+            self.update_info_display()
+            messagebox.showinfo(
+                "Success", "VNCake server started successfully!")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to start server: {e}")
+
+    def stop_server(self):
+        try:
+            if self.manager:
+                self.manager.cleanup_all_vms()
+
+            self.start_button.config(state=tk.NORMAL)
+            self.stop_button.config(state=tk.DISABLED)
+            self.status_label.config(text="Server: Stopped")
+
+            self.manager = None
+            self.server_thread = None
+
+            self.update_info_display()
+            messagebox.showinfo("Success", "VNCake server stopped!")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to stop server: {e}")
+
+    def open_web_interface(self):
+        import webbrowser
+        webbrowser.open("http://localhost:5000")
+
+    def update_info_display(self):
+        self.info_text.config(state=tk.NORMAL)
+        self.info_text.delete(1.0, tk.END)
+
+        info = f"""Configuration Summary:
+
+📁 Paths:
+   ISO Path: {self.config.get('iso_path')}
+   noVNC Path: {self.config.get('novnc_path')}
+   Database: {self.config.get('database')}
+
+🔧 Features:
+   CAPTCHA: {'Enabled' if self.config.get('enable_captcha') else 'Disabled'}
+   Tunneling: {'Enabled' if self.config.get(
+       'enable_tunneling') else 'Disabled'}
+   Tunnel Provider: {self.config.get('tunnel_provider')}
+   Tunnelify Available: {'Yes' if TUNNELIFY_AVAILABLE else 'No'}
+
+🖥️ VM Settings:
+   Memory: {self.config.get('vm_memory')} MB
+   CPUs: {self.config.get('vm_cpus')}
+   Timeout: {self.config.get('vm_timeout')} seconds
+
+🌐 Network:
+   Port Range Start: {self.config.get('port_range_start')}
+   VNC Port Range Start: {self.config.get('vnc_port_range_start')}
+
+📊 Server Status:
+   Status: {'Running' if self.manager else 'Stopped'}
+   Active Users: {len(self.manager.user_vms) if self.manager else 0}
+   Active VMs: {len(self.manager.user_vms) if self.manager else 0}
+   Web Interface: http://localhost:5000
+"""
+
+        self.info_text.insert(tk.END, info)
+        self.info_text.config(state=tk.DISABLED)
+
+    def clear_logs(self):
+        self.log_text.config(state=tk.NORMAL)
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.config(state=tk.DISABLED)
+
+    def refresh_logs(self):
+        try:
+            if os.path.exists('vncake.log'):
+                with open('vncake.log', 'r') as f:
+                    logs = f.read()
+
+                self.log_text.config(state=tk.NORMAL)
+                self.log_text.delete(1.0, tk.END)
+                self.log_text.insert(tk.END, logs)
+                self.log_text.see(tk.END)
+                self.log_text.config(state=tk.DISABLED)
+        except Exception as e:
+            self.log_text.config(state=tk.NORMAL)
+            self.log_text.delete(1.0, tk.END)
+            self.log_text.insert(tk.END, f"Error reading logs: {e}")
+            self.log_text.config(state=tk.DISABLED)
+
+    def on_provider_change(self, event=None):
+        self.update_subdomain_visibility()
+
+    def update_subdomain_visibility(self):
+        if self.tunnel_provider_var.get() == "localtunnel":
+            for widget in self.subdomain_frame.winfo_children():
+                widget.pack(
+                    side=tk.LEFT,
+                    padx=(
+                        10,
+                        0) if widget != self.subdomain_frame.winfo_children()[0] else (
+                        0,
+                        0))
+        else:
+            for widget in self.subdomain_frame.winfo_children():
+                widget.pack_forget()
+
+    def run(self):
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.root.mainloop()
+
+    def on_closing(self):
+        if self.manager:
+            if messagebox.askyesno("Quit",
+                                   "Server is running. Stop server and quit?"):
+                self.stop_server()
+                self.root.destroy()
+        else:
+            self.root.destroy()
+
+
+def run_cli_mode(args):
+    print("Starting VNCake in CLI mode...")
+
+    config = VNCakeConfig()
+
+    if args.iso_path:
+        config.set('iso_path', args.iso_path)
+    if args.novnc_path:
+        config.set('novnc_path', args.novnc_path)
+    if args.captcha is not None:
+        config.set('enable_captcha', args.captcha)
+    if args.tunneling is not None:
+        config.set('enable_tunneling', args.tunneling)
+        if args.tunnel_provider:
+            config.set('tunnel_provider', args.tunnel_provider)
+        if args.localtunnel_subdomain:
+            config.set('localtunnel_subdomain', args.localtunnel_subdomain)
+    if args.memory:
+        config.set('vm_memory', args.memory)
+    if args.cpus:
+        config.set('vm_cpus', args.cpus)
+    if args.timeout:
+        config.set('vm_timeout', args.timeout)
+    if args.port_start:
+        config.set('port_range_start', args.port_start)
+    if args.vnc_port_start:
+        config.set('vnc_port_range_start', args.vnc_port_start)
+    if args.host:
+        host = args.host
+    else:
+        host = '0.0.0.0'
+    if args.port:
+        port = args.port
+    else:
+        port = 5000
+
+    config.save_config()
+
+    print(f"\n🔧 Configuration:")
+    print(f"   ISO Path: {config.get('iso_path')}")
+    print(f"   noVNC Path: {config.get('novnc_path')}")
+    print(
+        f"   CAPTCHA: {
+            'Enabled' if config.get('enable_captcha') else 'Disabled'}")
+    print(
+        f"   Tunneling: {
+            'Enabled' if config.get('enable_tunneling') else 'Disabled'}")
+    print(f"   Tunnel Provider: {config.get('tunnel_provider')}")
+    if config.get('tunnel_provider') == 'localtunnel' and config.get(
+            'localtunnel_subdomain'):
+        print(
+            f"   Localtunnel Subdomain: {
+                config.get('localtunnel_subdomain')}")
+    print(f"   VM Memory: {config.get('vm_memory')} MB")
+    print(f"   VM CPUs: {config.get('vm_cpus')}")
+    print(f"   Server: {host}:{port}")
+
+    if not os.path.exists(config.get('iso_path')):
+        print(f"\n❌ Error: ISO file not found at {config.get('iso_path')}")
+        return
+
+    if not os.path.exists(config.get('novnc_path')):
+        print(
+            f"\n❌ Error: noVNC directory not found at {
+                config.get('novnc_path')}")
+        return
+
+    if config.get('enable_tunneling') and not TUNNELIFY_AVAILABLE:
+        print("\n⚠️  Warning: Tunneling enabled but tunnelify library not available")
+
+    print(f"\n🚀 Starting VNCake server...")
+    print(f"   Web Interface: http://localhost:{port}")
+    print(f"   Press Ctrl+C to stop\n")
+
+    manager = VNCakeManager(config)
+    try:
+        manager.run(host=host, port=port, debug=args.debug)
+    except KeyboardInterrupt:
+        print("\n\n🛑 Shutting down VNCake...")
+        manager.cleanup_all_vms()
+        print("✅ VNCake stopped successfully!")
+
+
+def main():
+    print(ASCII_ART)
+    parser = argparse.ArgumentParser(
+        description="VNCake - VM Management Platform",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  vncake                                   # Launch GUI mode
+  vncake --cli                             # Launch CLI mode with defaults
+  vncake --cli --iso-path /path/to/os.iso  # CLI with custom ISO
+  vncake --cli --no-captcha --tunneling    # CLI without CAPTCHA, with tunneling
+  vncake --cli --memory 8192 --cpus 8      # CLI with custom VM specs
+"""
+    )
+
+    parser.add_argument(
+        '--cli',
+        action='store_true',
+        help='Run in CLI mode (no GUI)')
+    parser.add_argument('--iso-path', help='Path to ISO file')
+    parser.add_argument(
+        '--novnc-path',
+        default='noVNC',
+        help='Path to noVNC directory (default: noVNC)')
+    parser.add_argument(
+        '--captcha',
+        action='store_true',
+        help='Enable CAPTCHA')
+    parser.add_argument(
+        '--no-captcha',
+        dest='captcha',
+        action='store_false',
+        help='Disable CAPTCHA')
+    parser.add_argument(
+        '--tunneling',
+        action='store_true',
+        help='Enable Cloudflare tunneling')
+    parser.add_argument(
+        '--no-tunneling',
+        dest='tunneling',
+        action='store_false',
+        help='Disable tunneling')
+    parser.add_argument(
+        '--tunnel-provider',
+        choices=[
+            'cloudflare',
+            'localtunnel'],
+        help='Tunnel provider (cloudflare or localtunnel)')
+    parser.add_argument(
+        '--localtunnel-subdomain',
+        help='Custom subdomain for localtunnel')
+    parser.add_argument('--memory', help='VM memory in MB (default: 4096)')
+    parser.add_argument('--cpus', help='VM CPU count (default: 4)')
+    parser.add_argument(
+        '--timeout',
+        type=int,
+        help='VM timeout in seconds (default: 1800)')
+    parser.add_argument(
+        '--port-start',
+        type=int,
+        help='VNC port range start (default: 5900)')
+    parser.add_argument(
+        '--vnc-port-start',
+        type=int,
+        help='noVNC port range start (default: 6080)')
+    parser.add_argument(
+        '--host',
+        default='0.0.0.0',
+        help='Server host (default: 0.0.0.0)')
+    parser.add_argument('--port', type=int, default=5000,
+                        help='Server port (default: 5000)')
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Enable debug mode')
+
+    parser.set_defaults(captcha=None, tunneling=None)
+
+    args = parser.parse_args()
+
+    if args.cli:
+        run_cli_mode(args)
+    else:
+        try:
+            gui = VNCakeGUI()
+            gui.run()
+        except ImportError as e:
+            print("GUI mode requires tkinter. Install it or use --cli flag.")
+            print(f"Error: {e}")
+        except Exception as e:
+            print(f"Failed to start GUI: {e}")
+            print("Use --cli flag for command-line mode.")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>VNCake - Login</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 50px; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); min-height: 100vh; display: flex; justify-content: center; align-items: center; }
+        .container { max-width: 400px; width: 100%; background: #222831; padding: 40px; border-radius: 15px; box-shadow: 0 15px 35px rgba(0,0,0,0.3); }
+        .header { text-align: center; margin-bottom: 30px; }
+        .logo { width: 60px; height: 60px; margin: 0 auto 15px; display: block; border-radius: 50%; background-color: #fff; padding: 5px; }
+        .title { font-size: 24px; font-weight: bold; color: #eeeeee; margin-top: 10px; }
+        input[type="email"], input[type="password"], input[type="text"] { width: 100%; padding: 15px; margin: 10px 0; border: 2px solid #393e46; border-radius: 8px; box-sizing: border-box; font-size: 16px; background: #393e46; color: #eeeeee; }
+        input:focus { border-color: #00adb5; outline: none; }
+        button { width: 100%; padding: 15px; background: linear-gradient(135deg, #00adb5 0%, #009ca3 100%); color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 16px; font-weight: bold; margin-top: 10px; }
+        button:hover { opacity: 0.9; }
+        .error { color: #ff4757; margin: 10px 0; text-align: center; }
+        .success { color: #2ed573; margin: 10px 0; text-align: center; }
+        .captcha-img { text-align: center; margin: 15px 0; }
+        a { color: #00adb5; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .footer { text-align: center; margin-top: 20px; color: #eeeeee; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <img src="{{ url_for('static', filename='vncake.png') }}" class="logo" alt="VNCake Logo">
+            <div class="title">VNCake Dashboard</div>
+        </div>
+        {% if error %}
+            <div class="error">{{ error }}</div>
+        {% endif %}
+        {% if success %}
+            <div class="success">{{ success }}</div>
+        {% endif %}
+        <form method="POST">
+            <input type="email" name="email" placeholder="Email" required>
+            <input type="password" name="password" placeholder="Password" required>
+            {% if enable_captcha %}
+            <div class="captcha-img">
+                <img src="data:image/png;base64,{{ captcha_img }}" alt="CAPTCHA">
+            </div>
+            <input type="text" name="captcha" placeholder="Enter CAPTCHA" required>
+            <input type="hidden" name="captcha_text" value="{{ captcha_text }}">
+            {% endif %}
+            <button type="submit">Login</button>
+        </form>
+        <div class="footer">
+            <p><a href="/signup">Don't have an account? Sign up</a></p>
+        </div>
+    </div>
+</body>
+</html>

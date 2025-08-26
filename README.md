@@ -2,7 +2,7 @@
 
 ![VNCake Title Image](https://raw.githubusercontent.com/MYusufY/VNCake/images/title.png)
 
-VNCake is an open-source program, to host your distrubution, or almost any operating system easily.
+VNCake is an open-source program, to host your distribution, or almost any operating system easily.
 
 Imagine  [DistroSea](https://distrosea.com/), but open sourced and you can self-host it.
 
@@ -65,7 +65,7 @@ With GUI and CLI options, it only takes a few clicks to deploy your VNCake serve
 	![basics](https://raw.githubusercontent.com/MYusufY/VNCake/images/basics.png)
 2. Enable Captcha
 	- When enabled, it will verify that the user is a human
-	- This does not effect the account system; email and password is still required.
+	- This does not affect the account system; email and password is still required.
 	**CLI**
 			`vncake --cli --captcha` -> Enable Captcha
 			`vncake --cli --no-captcha` -> Disable Captcha
@@ -77,7 +77,7 @@ With GUI and CLI options, it only takes a few clicks to deploy your VNCake serve
 		- Tunnel Providers:
 			- Cloudflare - stable
 			- Localtunnel - fast (for deploying)
-	- If you dont activate this, your VMs will only be accesible for you, on localhost.
+	- If you dont activate this, your VMs will only be accessible for you, on localhost.
 	**CLI**
 		`vncake --cli --tunneling` -> Activate tunneling
 		`vncake --cli --tunneling --tunnel-provider cloudflare` -> Use cloudflare as tunnel provider
@@ -133,7 +133,7 @@ mindmap
       (prevent overload)
       (Captcha options)
 ```
-2. VNCake Dashboard will be started on localhost. You can test it locally, but you need to host at the end, to make it accesible everywhere :) To do that, you can use tunneling (seperate from VM tunnels) or any other method.
+2. VNCake Dashboard will be started on localhost. You can test it locally, but you need to host at the end, to make it accessible everywhere :) To do that, you can use tunneling (separate from VM tunnels) or any other method.
 	VNCake only tunnels VMs (if activated). So it will not tunnel "itself". You should do it manually!
 	Basically, you can try or test it with:
 	`lt --port 5000 --subdomain myvncakeserver`

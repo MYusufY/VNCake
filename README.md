@@ -56,6 +56,15 @@ With GUI and CLI options, it only takes a few clicks to deploy your VNCake serve
 **Easy to host:** Online in one line.
 
 # Quickstart
+## Cloning
+1. `git clone --recurse-submodules https://github.com/MYusufY/VNCake.git`
+	
+ 	This will clone the VNCake with VNCake-custom noVNC fork in it. So everything should be ready!
+	If you want to use another noVNC, you can choose the path using the steps below.
+2. `cd VNCake`
+3. `./vncake` -> Default Python version, or `python3.yourversion vncake` for custom.
+
+## Usage
 1. Basics
 	- Set ISO path to be hosted and noVNC client path.
 	**CLI**

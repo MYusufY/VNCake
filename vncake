@@ -309,9 +309,7 @@ class VNCakeManager:
             '-vga',
             'std',
             '-vnc',
-            f'127.0.0.1:{
-                vnc_port -
-                self.config.get("port_range_start")}',
+            f'127.0.0.1:{vnc_port - self.config.get("port_range_start")}',
             '-name',
             f'VNCake-User{user_id}']
 

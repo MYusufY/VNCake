@@ -7,6 +7,8 @@ import sys
 import os
 import threading
 import json
+import platform
+import shutil
 from pathlib import Path
 from flask import Flask, render_template, request, redirect, url_for, session, flash, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -58,17 +60,56 @@ ASCII_ART = """
             VM Management Platform
 """
 
+IS_WINDOWS = platform.system() == 'Windows'
+IS_MACOS = platform.system() == 'Darwin'
+IS_LINUX = platform.system() == 'Linux'
+
+
+def find_executable(name, windows_name=None):
+    if windows_name is None:
+        windows_name = name
+    
+    exe = shutil.which(windows_name if IS_WINDOWS else name)
+    if exe:
+        return exe
+    
+    if IS_WINDOWS:
+        common_paths = [
+            f"C:\\Program Files\\qemu\\{windows_name}",
+            f"C:\\Program Files (x86)\\qemu\\{windows_name}",
+            f"C:\\qemu\\{windows_name}",
+        ]
+        for path in common_paths:
+            if os.path.exists(path):
+                return path
+    
+    return name
+
 
 class VNCakeConfig:
     def __init__(self):
         self.config_file = "vncake_config.json"
+        
+        if IS_WINDOWS:
+            qemu_default = find_executable("qemu-system-x86_64", "qemu-system-x86_64.exe")
+            novnc_default = "noVNC"
+            python_default = sys.executable
+            iso_default = "C:\\path\\to\\your.iso"
+        else:
+            qemu_default = find_executable("qemu-system-x86_64")
+            novnc_default = "noVNC"
+            python_default = "python3"
+            iso_default = "/root/agenticarch-host.iso"
+        
         self.defaults = {
-            "iso_path": "/root/agenticarch-host.iso",
-            "novnc_path": "noVNC",
+            "iso_path": iso_default,
+            "novnc_path": novnc_default,
+            "qemu_path": qemu_default,
+            "python_path": python_default,
             "enable_captcha": True,
             "tunnel_provider": "cloudflare",
-                        "enable_tunneling": False,
-                        "localtunnel_subdomain": "",
+            "enable_tunneling": False,
+            "localtunnel_subdomain": "",
             "vm_timeout": 1800,
             "port_range_start": 5900,
             "vnc_port_range_start": 6080,
@@ -136,8 +177,9 @@ class VNCakeManager:
             self.cleanup_all_vms()
             sys.exit(0)
 
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
+        if not IS_WINDOWS:
+            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGTERM, signal_handler)
         atexit.register(self.cleanup_all_vms)
 
     def setup_routes(self):
@@ -173,8 +215,7 @@ class VNCakeManager:
                                            captcha_img=captcha_img,
                                            enable_captcha=True)
                 else:
-                    return render_template(
-                        "signup.html", enable_captcha=False)
+                    return render_template("signup.html", enable_captcha=False)
 
             return self.handle_signup()
 
@@ -235,10 +276,7 @@ class VNCakeManager:
 
     def generate_captcha(self):
         image = ImageCaptcha(width=280, height=90)
-        captcha_text = ''.join(
-            secrets.choice(
-                string.ascii_uppercase +
-                string.digits) for _ in range(6))
+        captcha_text = ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(6))
         data = image.generate(captcha_text)
         img_base64 = base64.b64encode(data.getvalue()).decode()
         return captcha_text, img_base64
@@ -246,24 +284,20 @@ class VNCakeManager:
     def get_free_ports(self):
         used_ports = set()
         try:
-            for proc in psutil.process_iter(['pid', 'name']):
-                try:
-                    connections = proc.connections()
-                    for conn in connections:
-                        if conn.laddr:
-                            used_ports.add(conn.laddr.port)
-                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                    continue
-        except BaseException:
+            for conn in psutil.net_connections():
+                if conn.laddr:
+                    used_ports.add(conn.laddr.port)
+        except (psutil.AccessDenied, PermissionError):
             pass
+        except Exception as e:
+            self.logger.warning(f"Could not check used ports: {e}")
 
         vnc_port = self.config.get('port_range_start')
         while vnc_port in used_ports or vnc_port in self.port_assignments.values():
             vnc_port += 1
 
         novnc_port = self.config.get('vnc_port_range_start')
-        while novnc_port in used_ports or novnc_port in [
-                v['novnc_port'] for v in self.user_vms.values()]:
+        while novnc_port in used_ports or novnc_port in [v['novnc_port'] for v in self.user_vms.values()]:
             novnc_port += 1
 
         return vnc_port, novnc_port
@@ -277,8 +311,7 @@ class VNCakeManager:
                     sock.settimeout(1)
                     result = sock.connect_ex(('127.0.0.1', vnc_port))
                     if result == 0:
-                        self.logger.info(
-                            f"VNC server ready on port {vnc_port}")
+                        self.logger.info(f"VNC server ready on port {vnc_port}")
                         return True
             except BaseException:
                 pass
@@ -287,92 +320,146 @@ class VNCakeManager:
 
     def start_vm_for_user(self, user_id):
         if user_id in self.user_vms:
-            self.logger.warning(
-                f"VM start attempt for user {user_id} - VM already running")
+            self.logger.warning(f"VM start attempt for user {user_id} - VM already running")
             return self.user_vms[user_id]
 
         vnc_port, novnc_port = self.get_free_ports()
-        self.logger.info(
-            f"Starting VM for user {user_id} - VNC port: {vnc_port}, noVNC port: {novnc_port}")
+        self.logger.info(f"Starting VM for user {user_id} - VNC port: {vnc_port}, noVNC port: {novnc_port}")
+
+        qemu_path = self.config.get('qemu_path')
+        if not os.path.exists(qemu_path) and not shutil.which(qemu_path):
+            self.logger.error(f"QEMU not found at: {qemu_path}")
+            return None
 
         qemu_cmd = [
-            'qemu-system-x86_64',
-            '-m',
-            self.config.get('vm_memory'),
-            '-smp',
-            self.config.get('vm_cpus'),
-            '-enable-kvm',
-            '-cdrom',
-            self.config.get('iso_path'),
-            '-boot',
-            'd',
-            '-vga',
-            'std',
-            '-vnc',
-            f'127.0.0.1:{vnc_port - self.config.get("port_range_start")}',
-            '-name',
-            f'VNCake-User{user_id}']
+            qemu_path,
+            '-m', self.config.get('vm_memory'),
+            '-smp', self.config.get('vm_cpus'),
+            '-enable-kvm' if not IS_WINDOWS else '-accel', 'whpx' if not IS_WINDOWS else 'tcg',
+            '-cdrom', self.config.get('iso_path'),
+            '-boot', 'd',
+            '-vga', 'std',
+            '-vnc', f'127.0.0.1:{vnc_port - self.config.get("port_range_start")}',
+            '-name', f'VNCake-User{user_id}'
+        ]
+
+        if IS_WINDOWS:
+            qemu_cmd = [cmd for cmd in qemu_cmd if cmd != '-enable-kvm']
 
         try:
             qemu_proc = subprocess.Popen(
                 qemu_cmd,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL)
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
+            )
 
-            self.logger.info(
-                f"Waiting for QEMU to be ready on VNC port {vnc_port}...")
+            self.logger.info(f"Waiting for QEMU to be ready on VNC port {vnc_port}...")
             if not self.wait_for_vnc_ready(vnc_port):
-                self.logger.error(
-                    f"QEMU failed to start properly for user {user_id}")
+                self.logger.error(f"QEMU failed to start properly for user {user_id}")
                 qemu_proc.terminate()
                 return None
 
-            novnc_cmd = [
-                f'{self.config.get("novnc_path")}/utils/novnc_proxy',
-                '--vnc', f'127.0.0.1:{vnc_port}',
-                '--listen', f'127.0.0.1:{novnc_port}'
-            ]
+            novnc_path = self.config.get("novnc_path")
+            python_path = self.config.get('python_path')
+            
+            websockify_module = None
+            novnc_cmd = None
+            
+            try:
+                import websockify
+                websockify_module = True
+            except ImportError:
+                websockify_module = False
+            
+            if websockify_module:
+                novnc_cmd = [
+                    python_path, '-m', 'websockify',
+                    f'127.0.0.1:{novnc_port}',
+                    f'127.0.0.1:{vnc_port}',
+                    '--web', novnc_path
+                ]
+                self.logger.info(f"Using websockify module for noVNC")
+            else:
+                possible_scripts = [
+                    os.path.join(novnc_path, "utils", "websockify", "run"),
+                    os.path.join(novnc_path, "utils", "novnc_proxy"),
+                    os.path.join(novnc_path, "utils", "launch.sh"),
+                ]
+                
+                novnc_script = None
+                for script in possible_scripts:
+                    if os.path.exists(script):
+                        if IS_WINDOWS and not script.endswith('.py'):
+                            continue
+                        novnc_script = script
+                        break
+                
+                if not novnc_script:
+                    self.logger.error(f"websockify module not found and no suitable noVNC script found")
+                    self.logger.error(f"Please install websockify: pip install websockify")
+                    qemu_proc.terminate()
+                    return None
+                
+                if novnc_script.endswith('.py') or IS_WINDOWS:
+                    novnc_cmd = [
+                        python_path,
+                        novnc_script,
+                        '--vnc', f'127.0.0.1:{vnc_port}',
+                        '--listen', f'127.0.0.1:{novnc_port}'
+                    ]
+                else:
+                    novnc_cmd = [
+                        novnc_script,
+                        '--vnc', f'127.0.0.1:{vnc_port}',
+                        '--listen', f'127.0.0.1:{novnc_port}'
+                    ]
 
             novnc_proc = subprocess.Popen(
                 novnc_cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL)
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
+            )
 
-            time.sleep(2)
+            time.sleep(3)
+            
+            if novnc_proc.poll() is not None:
+                stdout, stderr = novnc_proc.communicate()
+                self.logger.error(f"noVNC failed to start for user {user_id}")
+                self.logger.error(f"noVNC stdout: {stdout.decode('utf-8', errors='ignore')}")
+                self.logger.error(f"noVNC stderr: {stderr.decode('utf-8', errors='ignore')}")
+                qemu_proc.terminate()
+                return None
+            
+            self.logger.info(f"noVNC started successfully on port {novnc_port}")
 
             tunnel_url = None
             tunnel_proc = None
 
             if self.config.get('enable_tunneling') and TUNNELIFY_AVAILABLE:
                 try:
-                    self.logger.info(
-                        f"Creating tunnel for user {user_id}...")
+                    self.logger.info(f"Creating tunnel for user {user_id}...")
                     provider = self.config.get('tunnel_provider')
 
                     if provider == "localtunnel":
                         subdomain = self.config.get('localtunnel_subdomain')
                         if subdomain:
                             import random
-                            random_suffix = ''.join(
-                                random.choices('0123456789abcdef', k=8))
+                            random_suffix = ''.join(random.choices('0123456789abcdef', k=8))
                             custom_subdomain = f"{subdomain}-{random_suffix}"
-                            base_tunnel_url, _ = tunnel(
-                                novnc_port, "localtunnel", custom_subdomain)
+                            base_tunnel_url, _ = tunnel(novnc_port, "localtunnel", custom_subdomain)
                         else:
-                            base_tunnel_url, _ = tunnel(
-                                novnc_port, "localtunnel")
+                            base_tunnel_url, _ = tunnel(novnc_port, "localtunnel")
                     else:
-                        base_tunnel_url, tunnel_proc = tunnel(
-                            novnc_port, "cloudflare")
+                        base_tunnel_url, tunnel_proc = tunnel(novnc_port, "cloudflare")
 
                     tunnel_url = f"{base_tunnel_url}/vnc.html?autoconnect=true&resize=scale"
                     if provider == "cloudflare":
                         self.user_tunnels[user_id] = tunnel_proc
-                    self.logger.info(
-                        f"Tunnel created for user {user_id}: {tunnel_url}")
+                    self.logger.info(f"Tunnel created for user {user_id}: {tunnel_url}")
                 except Exception as e:
-                    self.logger.error(
-                        f"Failed to create tunnel for user {user_id}: {e}")
+                    self.logger.error(f"Failed to create tunnel for user {user_id}: {e}")
 
             vm_info = {
                 'vnc_port': vnc_port,
@@ -392,23 +479,17 @@ class VNCakeManager:
             conn.execute(
                 '''INSERT INTO vm_sessions (user_id, vnc_port, novnc_port, qemu_pid, novnc_pid, tunnel_url)
                             VALUES (?, ?, ?, ?, ?, ?)''',
-                (user_id,
-                 vnc_port,
-                 novnc_port,
-                 qemu_proc.pid,
-                 novnc_proc.pid,
-                 tunnel_url))
+                (user_id, vnc_port, novnc_port, qemu_proc.pid, novnc_proc.pid, tunnel_url)
+            )
             conn.commit()
             conn.close()
 
-            self.logger.info(
-                f"VM successfully started for user {user_id} - QEMU PID: {
-                    qemu_proc.pid}, noVNC PID: {
-                    novnc_proc.pid}")
+            self.logger.info(f"VM successfully started for user {user_id} - QEMU PID: {qemu_proc.pid}, noVNC PID: {novnc_proc.pid}")
             return vm_info
         except Exception as e:
-            self.logger.error(
-                f"Failed to start VM for user {user_id}: {e}")
+            self.logger.error(f"Failed to start VM for user {user_id}: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
             return None
 
     def kill_vm_for_user(self, user_id):
@@ -416,10 +497,7 @@ class VNCakeManager:
             return False
 
         vm_info = self.user_vms[user_id]
-        self.logger.info(
-            f"Killing VM for user {user_id} - QEMU PID: {
-                vm_info['qemu_pid']}, noVNC PID: {
-                vm_info['novnc_pid']}")
+        self.logger.info(f"Killing VM for user {user_id} - QEMU PID: {vm_info['qemu_pid']}, noVNC PID: {vm_info['novnc_pid']}")
 
         try:
             if vm_info['qemu_proc'].poll() is None:
@@ -427,7 +505,11 @@ class VNCakeManager:
                 vm_info['qemu_proc'].wait(timeout=5)
         except BaseException:
             try:
-                os.kill(vm_info['qemu_pid'], signal.SIGTERM)
+                if IS_WINDOWS:
+                    subprocess.call(['taskkill', '/F', '/T', '/PID', str(vm_info['qemu_pid'])], 
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    os.kill(vm_info['qemu_pid'], signal.SIGTERM)
             except BaseException:
                 pass
 
@@ -437,7 +519,11 @@ class VNCakeManager:
                 vm_info['novnc_proc'].wait(timeout=5)
         except BaseException:
             try:
-                os.kill(vm_info['novnc_pid'], signal.SIGTERM)
+                if IS_WINDOWS:
+                    subprocess.call(['taskkill', '/F', '/T', '/PID', str(vm_info['novnc_pid'])],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    os.kill(vm_info['novnc_pid'], signal.SIGTERM)
             except BaseException:
                 pass
 
@@ -472,13 +558,11 @@ class VNCakeManager:
             inactive_users = []
 
             for user_id, last_activity in self.user_activity.items():
-                if current_time - \
-                        last_activity > self.config.get('vm_timeout'):
+                if current_time - last_activity > self.config.get('vm_timeout'):
                     inactive_users.append(user_id)
 
             for user_id in inactive_users:
-                self.logger.info(
-                    f"VM timeout for user {user_id} - killing due to inactivity")
+                self.logger.info(f"VM timeout for user {user_id} - killing due to inactivity")
                 self.kill_vm_for_user(user_id)
 
             time.sleep(60)
@@ -492,8 +576,7 @@ class VNCakeManager:
             captcha_stored = session.get('captcha', '')
 
             if captcha_input.upper() != captcha_stored.upper():
-                self.logger.warning(
-                    f"Invalid CAPTCHA for login attempt: {email}")
+                self.logger.warning(f"Invalid CAPTCHA for login attempt: {email}")
                 captcha_text, captcha_img = self.generate_captcha()
                 session['captcha'] = captcha_text
                 return render_template("login.html",
@@ -503,17 +586,14 @@ class VNCakeManager:
                                        enable_captcha=True)
 
         conn = self.get_db_connection()
-        user = conn.execute(
-            'SELECT * FROM users WHERE email = ?', (email,)).fetchone()
+        user = conn.execute('SELECT * FROM users WHERE email = ?', (email,)).fetchone()
         conn.close()
 
         if user and check_password_hash(user['password_hash'], password):
             session['user_id'] = user['id']
             session['user_email'] = user['email']
             session.permanent = True
-            self.logger.info(
-                f"Successful login for user ID {
-                    user['id']} ({email})")
+            self.logger.info(f"Successful login for user ID {user['id']} ({email})")
             return redirect(url_for('dashboard'))
         else:
             self.logger.warning(f"Failed login attempt for email: {email}")
@@ -540,8 +620,7 @@ class VNCakeManager:
             captcha_stored = session.get('captcha', '')
 
             if captcha_input.upper() != captcha_stored.upper():
-                self.logger.warning(
-                    f"Invalid CAPTCHA for signup attempt: {email}")
+                self.logger.warning(f"Invalid CAPTCHA for signup attempt: {email}")
                 captcha_text, captcha_img = self.generate_captcha()
                 session['captcha'] = captcha_text
                 return render_template("signup.html",
@@ -580,8 +659,7 @@ class VNCakeManager:
                                        enable_captcha=False)
 
         conn = self.get_db_connection()
-        existing_user = conn.execute(
-            'SELECT id FROM users WHERE email = ?', (email,)).fetchone()
+        existing_user = conn.execute('SELECT id FROM users WHERE email = ?', (email,)).fetchone()
 
         if existing_user:
             conn.close()
@@ -601,9 +679,7 @@ class VNCakeManager:
                                        enable_captcha=False)
 
         password_hash = generate_password_hash(password)
-        conn.execute(
-            '''INSERT INTO users (email, password_hash)
-                        VALUES (?, ?)''', (email, password_hash))
+        conn.execute('''INSERT INTO users (email, password_hash) VALUES (?, ?)''', (email, password_hash))
         conn.commit()
         conn.close()
 
@@ -641,22 +717,21 @@ class VNCakeManager:
             novnc_port = vm_info['novnc_port']
             tunnel_url = vm_info.get('tunnel_url')
             self.user_activity[user_id] = time.time()
-            self.logger.info(
-                f"Dashboard access for user {user_id} - VM running on ports VNC:{vnc_port} noVNC:{novnc_port}")
+            self.logger.info(f"Dashboard access for user {user_id} - VM running on ports VNC:{vnc_port} noVNC:{novnc_port}")
         else:
-            self.logger.info(
-                f"Dashboard access for user {user_id} - no VM running")
+            self.logger.info(f"Dashboard access for user {user_id} - no VM running")
 
         return render_template(
-			"dashboard.html",
-			user_email=user_email,
-			vm_running=vm_running,
-			vnc_port=vnc_port,
-			novnc_port=novnc_port,
-			tunnel_url=tunnel_url,
-			active_users_count=len(self.user_vms),
-			enable_tunneling=self.config.get('enable_tunneling'),
-			show_local_access=self.config.get('show_local_access'))
+            "dashboard.html",
+            user_email=user_email,
+            vm_running=vm_running,
+            vnc_port=vnc_port,
+            novnc_port=novnc_port,
+            tunnel_url=tunnel_url,
+            active_users_count=len(self.user_vms),
+            enable_tunneling=self.config.get('enable_tunneling'),
+            show_local_access=self.config.get('show_local_access')
+        )
 
     def handle_start_vm(self):
         if 'user_id' not in session:
@@ -665,8 +740,7 @@ class VNCakeManager:
         user_id = session['user_id']
 
         if user_id in self.user_vms:
-            self.logger.info(
-                f"VM start request for user {user_id} - already running")
+            self.logger.info(f"VM start request for user {user_id} - already running")
             return jsonify({'success': False, 'error': 'VM already running'})
 
         self.logger.info(f"Starting VM for user {user_id}")
@@ -717,16 +791,13 @@ class VNCakeManager:
         self.logger.info("VNCake Manager starting up...")
         self.init_db()
 
-        cleanup_thread = threading.Thread(
-            target=self.cleanup_inactive_vms, daemon=True)
+        cleanup_thread = threading.Thread(target=self.cleanup_inactive_vms, daemon=True)
         cleanup_thread.start()
         self.logger.info("VM cleanup thread started")
 
-        self.logger.info(
-            f"VNCake Manager ready - Access at http://localhost:{port}")
+        self.logger.info(f"VNCake Manager ready - Access at http://localhost:{port}")
         if self.config.get('enable_tunneling') and not TUNNELIFY_AVAILABLE:
-            self.logger.warning(
-                "Tunneling enabled but tunnelify library not available")
+            self.logger.warning("Tunneling enabled but tunnelify library not available")
 
         self.app.run(host=host, port=port, debug=debug)
 
@@ -740,7 +811,7 @@ class VNCakeGUI:
         self.setup_gui()
 
     def setup_gui(self):
-        self.root.title("VNCake Manager - Configuration & Control")
+        self.root.title("VNCake Manager")
         self.root.geometry("800x900")
         self.root.resizable(True, True)
 
@@ -753,14 +824,15 @@ class VNCakeGUI:
         header_frame = ttk.Frame(main_frame)
         header_frame.pack(fill=tk.X, pady=(0, 20))
 
-        logo_image = tk.PhotoImage(file="static/vncake.png")
-        logo_label = tk.Label(header_frame, image=logo_image)
-        logo_label.image = logo_image
-        logo_label.pack(side=tk.LEFT)
+        try:
+            logo_image = tk.PhotoImage(file="static/vncake.png")
+            logo_label = tk.Label(header_frame, image=logo_image)
+            logo_label.image = logo_image
+            logo_label.pack(side=tk.LEFT)
+        except:
+            pass
 
-        title_label = tk.Label(
-            header_frame, text="VNCake Dashboard", font=(
-                "Arial", 18, "bold"))
+        title_label = tk.Label(header_frame, text="VNCake Dashboard", font=("Arial", 18, "bold"))
         title_label.pack(side=tk.LEFT, padx=(10, 0))
 
         notebook = ttk.Notebook(main_frame)
@@ -781,8 +853,7 @@ class VNCakeGUI:
 
     def setup_config_tab(self, parent):
         canvas = tk.Canvas(parent)
-        scrollbar = ttk.Scrollbar(
-            parent, orient="vertical", command=canvas.yview)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
 
         scrollable_frame.bind(
@@ -790,257 +861,140 @@ class VNCakeGUI:
             lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
 
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas_frame = canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        
+        def configure_scroll_region(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            canvas.itemconfig(canvas_frame, width=event.width)
+        
+        canvas.bind("<Configure>", configure_scroll_region)
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        paths_label = ttk.Label(scrollable_frame, text="Paths Configuration",
-                                font=("Arial", 14, "bold"))
+        paths_label = ttk.Label(scrollable_frame, text="Paths Configuration", font=("Arial", 14, "bold"))
         paths_label.pack(anchor=tk.W, pady=(0, 10))
 
         iso_frame = ttk.Frame(scrollable_frame)
         iso_frame.pack(fill=tk.X, pady=5)
         ttk.Label(iso_frame, text="ISO Path:").pack(side=tk.LEFT)
         self.iso_path_var = tk.StringVar(value=self.config.get('iso_path'))
-        iso_entry = ttk.Entry(
-            iso_frame,
-            textvariable=self.iso_path_var,
-            width=50)
+        iso_entry = ttk.Entry(iso_frame, textvariable=self.iso_path_var, width=50)
         iso_entry.pack(side=tk.LEFT, padx=(10, 5), expand=True, fill=tk.X)
-        ttk.Button(iso_frame, text="Browse", command=lambda: self.browse_file(
-            self.iso_path_var, "ISO files", "*.iso")).pack(side=tk.RIGHT)
+        ttk.Button(iso_frame, text="Browse", command=lambda: self.browse_file(self.iso_path_var, "ISO files", "*.iso")).pack(side=tk.RIGHT)
 
         novnc_frame = ttk.Frame(scrollable_frame)
         novnc_frame.pack(fill=tk.X, pady=5)
         ttk.Label(novnc_frame, text="noVNC Path:").pack(side=tk.LEFT)
         self.novnc_path_var = tk.StringVar(value=self.config.get('novnc_path'))
-        novnc_entry = ttk.Entry(
-            novnc_frame,
-            textvariable=self.novnc_path_var,
-            width=50)
+        novnc_entry = ttk.Entry(novnc_frame, textvariable=self.novnc_path_var, width=50)
         novnc_entry.pack(side=tk.LEFT, padx=(10, 5), expand=True, fill=tk.X)
-        ttk.Button(
-            novnc_frame,
-            text="Browse",
-            command=lambda: self.browse_directory(
-                self.novnc_path_var)).pack(
-            side=tk.RIGHT)
+        ttk.Button(novnc_frame, text="Browse", command=lambda: self.browse_directory(self.novnc_path_var)).pack(side=tk.RIGHT)
 
-        ttk.Separator(
-            scrollable_frame,
-            orient='horizontal').pack(
-            fill=tk.X,
-            pady=20)
+        qemu_frame = ttk.Frame(scrollable_frame)
+        qemu_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(qemu_frame, text="QEMU Path:").pack(side=tk.LEFT)
+        self.qemu_path_var = tk.StringVar(value=self.config.get('qemu_path'))
+        qemu_entry = ttk.Entry(qemu_frame, textvariable=self.qemu_path_var, width=50)
+        qemu_entry.pack(side=tk.LEFT, padx=(10, 5), expand=True, fill=tk.X)
+        ttk.Button(qemu_frame, text="Browse", command=lambda: self.browse_file(self.qemu_path_var, "QEMU executable", "*")).pack(side=tk.RIGHT)
 
-        features_label = ttk.Label(scrollable_frame, text="Features",
-                                   font=("Arial", 14, "bold"))
+        python_frame = ttk.Frame(scrollable_frame)
+        python_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(python_frame, text="Python Path:").pack(side=tk.LEFT)
+        self.python_path_var = tk.StringVar(value=self.config.get('python_path'))
+        python_entry = ttk.Entry(python_frame, textvariable=self.python_path_var, width=50)
+        python_entry.pack(side=tk.LEFT, padx=(10, 5), expand=True, fill=tk.X)
+        ttk.Button(python_frame, text="Browse", command=lambda: self.browse_file(self.python_path_var, "Python executable", "*")).pack(side=tk.RIGHT)
+
+        ttk.Separator(scrollable_frame, orient='horizontal').pack(fill=tk.X, pady=20)
+
+        features_label = ttk.Label(scrollable_frame, text="Features", font=("Arial", 14, "bold"))
         features_label.pack(anchor=tk.W, pady=(0, 10))
 
-        self.captcha_var = tk.BooleanVar(
-            value=self.config.get('enable_captcha'))
-        ttk.Checkbutton(scrollable_frame, text="Enable CAPTCHA",
-                        variable=self.captcha_var).pack(anchor=tk.W, pady=2)
+        self.captcha_var = tk.BooleanVar(value=self.config.get('enable_captcha'))
+        ttk.Checkbutton(scrollable_frame, text="Enable CAPTCHA", variable=self.captcha_var).pack(anchor=tk.W, pady=2)
 
-        self.tunneling_var = tk.BooleanVar(
-    value=self.config.get('enable_tunneling'))
+        self.tunneling_var = tk.BooleanVar(value=self.config.get('enable_tunneling'))
         tunnel_frame = ttk.Frame(scrollable_frame)
         tunnel_frame.pack(fill=tk.X, pady=2)
-        ttk.Checkbutton(
-            tunnel_frame,
-            text="Enable Tunneling",
-            variable=self.tunneling_var).pack(
-            side=tk.LEFT)
+        ttk.Checkbutton(tunnel_frame, text="Enable Tunneling", variable=self.tunneling_var).pack(side=tk.LEFT)
         if not TUNNELIFY_AVAILABLE:
-            ttk.Label(
-                tunnel_frame,
-                text="(tunnelify not installed)",
-                foreground="red").pack(
-                side=tk.LEFT,
-                padx=(
-                        10,
-                        0))
+            ttk.Label(tunnel_frame, text="(tunnelify not installed)", foreground="red").pack(side=tk.LEFT, padx=(10, 0))
 
         tunnel_provider_frame = ttk.Frame(scrollable_frame)
         tunnel_provider_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(
-            tunnel_provider_frame,
-            text="Tunnel Provider:").pack(
-            side=tk.LEFT)
-        self.tunnel_provider_var = tk.StringVar(
-            value=self.config.get('tunnel_provider'))
-        provider_combo = ttk.Combobox(
-            tunnel_provider_frame,
-            textvariable=self.tunnel_provider_var,
-            values=[
-                    "cloudflare",
-                        "localtunnel"],
-            state="readonly",
-            width=15)
+        ttk.Label(tunnel_provider_frame, text="Tunnel Provider:").pack(side=tk.LEFT)
+        self.tunnel_provider_var = tk.StringVar(value=self.config.get('tunnel_provider'))
+        provider_combo = ttk.Combobox(tunnel_provider_frame, textvariable=self.tunnel_provider_var, values=["cloudflare", "localtunnel"], state="readonly", width=15)
         provider_combo.pack(side=tk.LEFT, padx=(10, 0))
-        provider_combo.bind(
-            "<<ComboboxSelected>>",
-                self.on_provider_change)
+        provider_combo.bind("<<ComboboxSelected>>", self.on_provider_change)
 
         self.subdomain_frame = ttk.Frame(scrollable_frame)
         self.subdomain_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(
-            self.subdomain_frame,
-            text="Localtunnel Subdomain:").pack(
-            side=tk.LEFT)
-        self.subdomain_var = tk.StringVar(
-            value=self.config.get('localtunnel_subdomain'))
-        ttk.Entry(
-            self.subdomain_frame,
-            textvariable=self.subdomain_var,
-            width=20).pack(
-            side=tk.LEFT,
-            padx=(
-                    10,
-                    0))
-        ttk.Label(
-            self.subdomain_frame,
-            text="(leave blank for random)",
-            foreground="gray").pack(
-            side=tk.LEFT,
-            padx=(
-                    10,
-                    0))
+        ttk.Label(self.subdomain_frame, text="Localtunnel Subdomain:").pack(side=tk.LEFT)
+        self.subdomain_var = tk.StringVar(value=self.config.get('localtunnel_subdomain'))
+        ttk.Entry(self.subdomain_frame, textvariable=self.subdomain_var, width=20).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Label(self.subdomain_frame, text="(leave blank for random)", foreground="gray").pack(side=tk.LEFT, padx=(10, 0))
 
         self.update_subdomain_visibility()
 
-        self.local_access_var = tk.BooleanVar(
-            value=self.config.get('show_local_access'))
-        ttk.Checkbutton(
-            scrollable_frame,
-            text="Show Local Access Button",
-            variable=self.local_access_var).pack(
-            anchor=tk.W,
-            pady=2)
+        self.local_access_var = tk.BooleanVar(value=self.config.get('show_local_access'))
+        ttk.Checkbutton(scrollable_frame, text="Show Local Access Button", variable=self.local_access_var).pack(anchor=tk.W, pady=2)
 
-        ttk.Separator(
-            scrollable_frame,
-            orient='horizontal').pack(
-            fill=tk.X,
-            pady=20)
+        ttk.Separator(scrollable_frame, orient='horizontal').pack(fill=tk.X, pady=20)
 
-        vm_label = ttk.Label(scrollable_frame, text="VM Configuration",
-                             font=("Arial", 14, "bold"))
+        vm_label = ttk.Label(scrollable_frame, text="VM Configuration", font=("Arial", 14, "bold"))
         vm_label.pack(anchor=tk.W, pady=(0, 10))
 
         memory_frame = ttk.Frame(scrollable_frame)
         memory_frame.pack(fill=tk.X, pady=5)
         ttk.Label(memory_frame, text="VM Memory (MB):").pack(side=tk.LEFT)
         self.memory_var = tk.StringVar(value=self.config.get('vm_memory'))
-        ttk.Entry(
-            memory_frame,
-            textvariable=self.memory_var,
-            width=10).pack(
-            side=tk.LEFT,
-            padx=(
-                10,
-                0))
+        ttk.Entry(memory_frame, textvariable=self.memory_var, width=10).pack(side=tk.LEFT, padx=(10, 0))
 
         cpus_frame = ttk.Frame(scrollable_frame)
         cpus_frame.pack(fill=tk.X, pady=5)
         ttk.Label(cpus_frame, text="VM CPUs:").pack(side=tk.LEFT)
         self.cpus_var = tk.StringVar(value=self.config.get('vm_cpus'))
-        ttk.Entry(
-            cpus_frame,
-            textvariable=self.cpus_var,
-            width=10).pack(
-            side=tk.LEFT,
-            padx=(
-                10,
-                0))
+        ttk.Entry(cpus_frame, textvariable=self.cpus_var, width=10).pack(side=tk.LEFT, padx=(10, 0))
 
         timeout_frame = ttk.Frame(scrollable_frame)
         timeout_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(
-            timeout_frame,
-            text="VM Timeout (seconds):").pack(
-            side=tk.LEFT)
-        self.timeout_var = tk.StringVar(
-            value=str(self.config.get('vm_timeout')))
-        ttk.Entry(
-            timeout_frame,
-            textvariable=self.timeout_var,
-            width=10).pack(
-            side=tk.LEFT,
-            padx=(
-                10,
-                0))
+        ttk.Label(timeout_frame, text="VM Timeout (seconds):").pack(side=tk.LEFT)
+        self.timeout_var = tk.StringVar(value=str(self.config.get('vm_timeout')))
+        ttk.Entry(timeout_frame, textvariable=self.timeout_var, width=10).pack(side=tk.LEFT, padx=(10, 0))
 
-        ttk.Separator(
-            scrollable_frame,
-            orient='horizontal').pack(
-            fill=tk.X,
-            pady=20)
+        ttk.Separator(scrollable_frame, orient='horizontal').pack(fill=tk.X, pady=20)
 
-        network_label = ttk.Label(
-            scrollable_frame,
-            text="Network Configuration",
-            font=(
-                "Arial",
-                14,
-                "bold"))
+        network_label = ttk.Label(scrollable_frame, text="Network Configuration", font=("Arial", 14, "bold"))
         network_label.pack(anchor=tk.W, pady=(0, 10))
 
         port_start_frame = ttk.Frame(scrollable_frame)
         port_start_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(
-            port_start_frame,
-            text="Port Range Start:").pack(
-            side=tk.LEFT)
-        self.port_start_var = tk.StringVar(
-            value=str(self.config.get('port_range_start')))
-        ttk.Entry(
-            port_start_frame,
-            textvariable=self.port_start_var,
-            width=10).pack(
-            side=tk.LEFT,
-            padx=(
-                10,
-                0))
+        ttk.Label(port_start_frame, text="Port Range Start:").pack(side=tk.LEFT)
+        self.port_start_var = tk.StringVar(value=str(self.config.get('port_range_start')))
+        ttk.Entry(port_start_frame, textvariable=self.port_start_var, width=10).pack(side=tk.LEFT, padx=(10, 0))
 
         vnc_port_start_frame = ttk.Frame(scrollable_frame)
         vnc_port_start_frame.pack(fill=tk.X, pady=5)
-        ttk.Label(
-            vnc_port_start_frame,
-            text="VNC Port Range Start:").pack(
-            side=tk.LEFT)
-        self.vnc_port_start_var = tk.StringVar(
-            value=str(self.config.get('vnc_port_range_start')))
-        ttk.Entry(
-            vnc_port_start_frame,
-            textvariable=self.vnc_port_start_var,
-            width=10).pack(
-            side=tk.LEFT,
-            padx=(
-                10,
-                0))
+        ttk.Label(vnc_port_start_frame, text="VNC Port Range Start:").pack(side=tk.LEFT)
+        self.vnc_port_start_var = tk.StringVar(value=str(self.config.get('vnc_port_range_start')))
+        ttk.Entry(vnc_port_start_frame, textvariable=self.vnc_port_start_var, width=10).pack(side=tk.LEFT, padx=(10, 0))
 
-        ttk.Separator(
-            scrollable_frame,
-            orient='horizontal').pack(
-            fill=tk.X,
-            pady=20)
+        ttk.Separator(scrollable_frame, orient='horizontal').pack(fill=tk.X, pady=20)
 
         save_frame = ttk.Frame(scrollable_frame)
         save_frame.pack(fill=tk.X, pady=20)
-        ttk.Button(save_frame, text="Save Configuration",
-                   command=self.save_config).pack(side=tk.RIGHT)
-        ttk.Button(save_frame, text="Reset to Defaults",
-                   command=self.reset_config).pack(side=tk.RIGHT, padx=(0, 10))
+        ttk.Button(save_frame, text="Save Configuration", command=self.save_config).pack(side=tk.RIGHT)
+        ttk.Button(save_frame, text="Reset to Defaults", command=self.reset_config).pack(side=tk.RIGHT, padx=(0, 10))
 
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
-
+    
     def setup_control_tab(self, parent):
-        status_frame = ttk.LabelFrame(
-            parent, text="Server Status", padding="15")
+        status_frame = ttk.LabelFrame(parent, text="Server Status", padding="15")
         status_frame.pack(fill=tk.X, pady=(0, 20))
 
-        self.status_label = ttk.Label(status_frame, text="Server: Stopped",
-                                      font=("Arial", 12, "bold"))
+        self.status_label = ttk.Label(status_frame, text="Server: Stopped", font=("Arial", 12, "bold"))
         self.status_label.pack(anchor=tk.W)
 
         controls_frame = ttk.LabelFrame(parent, text="Controls", padding="15")
@@ -1049,65 +1003,40 @@ class VNCakeGUI:
         button_frame = ttk.Frame(controls_frame)
         button_frame.pack(fill=tk.X)
 
-        self.start_button = ttk.Button(
-            button_frame,
-            text="Start Server",
-            command=self.start_server,
-            state=tk.NORMAL)
+        self.start_button = ttk.Button(button_frame, text="Start Server", command=self.start_server, state=tk.NORMAL)
         self.start_button.pack(side=tk.LEFT, padx=(0, 10))
 
-        self.stop_button = ttk.Button(
-            button_frame,
-            text="Stop Server",
-            command=self.stop_server,
-            state=tk.DISABLED)
+        self.stop_button = ttk.Button(button_frame, text="Stop Server", command=self.stop_server, state=tk.DISABLED)
         self.stop_button.pack(side=tk.LEFT, padx=(0, 10))
 
-        ttk.Button(button_frame, text="Open Web Interface",
-                   command=self.open_web_interface).pack(side=tk.LEFT)
+        ttk.Button(button_frame, text="Open Web Interface", command=self.open_web_interface).pack(side=tk.LEFT)
+        ttk.Button(button_frame, text="Refresh Info", command=self.update_info_display).pack(side=tk.LEFT, padx=(10, 0))
 
-        ttk.Button(
-            button_frame,
-            text="Refresh Info",
-            command=self.update_info_display).pack(
-            side=tk.LEFT,
-            padx=(
-                10,
-                0))
-
-        info_frame = ttk.LabelFrame(
-            parent, text="Server Information", padding="15")
+        info_frame = ttk.LabelFrame(parent, text="Server Information", padding="15")
         info_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.info_text = scrolledtext.ScrolledText(
-            info_frame, height=15, state=tk.DISABLED)
+        self.info_text = scrolledtext.ScrolledText(info_frame, height=15, state=tk.DISABLED)
         self.info_text.pack(fill=tk.BOTH, expand=True)
 
         self.update_info_display()
 
     def setup_logs_tab(self, parent):
-        log_frame = ttk.LabelFrame(
-            parent, text="Application Logs", padding="15")
+        log_frame = ttk.LabelFrame(parent, text="Application Logs", padding="15")
         log_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.log_text = scrolledtext.ScrolledText(
-            log_frame, height=25, state=tk.DISABLED)
+        self.log_text = scrolledtext.ScrolledText(log_frame, height=25, state=tk.DISABLED)
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
         button_frame = ttk.Frame(log_frame)
         button_frame.pack(fill=tk.X, pady=(10, 0))
 
-        ttk.Button(button_frame, text="Clear Logs",
-                   command=self.clear_logs).pack(side=tk.LEFT)
-        ttk.Button(button_frame, text="Refresh",
-                   command=self.refresh_logs).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(button_frame, text="Clear Logs", command=self.clear_logs).pack(side=tk.LEFT)
+        ttk.Button(button_frame, text="Refresh", command=self.refresh_logs).pack(side=tk.LEFT, padx=(10, 0))
 
         self.refresh_logs()
 
     def browse_file(self, var, title, filetypes):
-        filename = filedialog.askopenfilename(
-            title=f"Select {title}", filetypes=[
-                (title, filetypes), ("All files", "*.*")])
+        filename = filedialog.askopenfilename(title=f"Select {title}", filetypes=[(title, filetypes), ("All files", "*.*")])
         if filename:
             var.set(filename)
 
@@ -1120,6 +1049,8 @@ class VNCakeGUI:
         try:
             self.config.set('iso_path', self.iso_path_var.get())
             self.config.set('novnc_path', self.novnc_path_var.get())
+            self.config.set('qemu_path', self.qemu_path_var.get())
+            self.config.set('python_path', self.python_path_var.get())
             self.config.set('enable_captcha', self.captcha_var.get())
             self.config.set('enable_tunneling', self.tunneling_var.get())
             self.config.set('tunnel_provider', self.tunnel_provider_var.get())
@@ -1140,9 +1071,7 @@ class VNCakeGUI:
             messagebox.showerror("Error", f"Failed to save configuration: {e}")
 
     def reset_config(self):
-        if messagebox.askyesno(
-            "Reset Configuration",
-                "Are you sure you want to reset to default values?"):
+        if messagebox.askyesno("Reset Configuration", "Are you sure you want to reset to default values?"):
             self.config.config = self.config.defaults.copy()
             self.load_config_to_gui()
             messagebox.showinfo("Reset", "Configuration reset to defaults!")
@@ -1150,6 +1079,8 @@ class VNCakeGUI:
     def load_config_to_gui(self):
         self.iso_path_var.set(self.config.get('iso_path'))
         self.novnc_path_var.set(self.config.get('novnc_path'))
+        self.qemu_path_var.set(self.config.get('qemu_path'))
+        self.python_path_var.set(self.config.get('python_path'))
         self.captcha_var.set(self.config.get('enable_captcha'))
         self.tunneling_var.set(self.config.get('enable_tunneling'))
         self.local_access_var.set(self.config.get('show_local_access'))
@@ -1172,9 +1103,13 @@ class VNCakeGUI:
                 messagebox.showerror("Error", "noVNC directory not found!")
                 return
 
+            qemu_path = self.config.get('qemu_path')
+            if not os.path.exists(qemu_path) and not shutil.which(qemu_path):
+                messagebox.showerror("Error", f"QEMU not found at: {qemu_path}")
+                return
+
             self.manager = VNCakeManager(self.config)
-            self.server_thread = threading.Thread(
-                target=self.manager.run, daemon=True)
+            self.server_thread = threading.Thread(target=self.manager.run, daemon=True)
             self.server_thread.start()
 
             self.start_button.config(state=tk.DISABLED)
@@ -1182,8 +1117,7 @@ class VNCakeGUI:
             self.status_label.config(text="Server: Running")
 
             self.update_info_display()
-            messagebox.showinfo(
-                "Success", "VNCake server started successfully!")
+            messagebox.showinfo("Success", "VNCake server started successfully!")
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to start server: {e}")
@@ -1216,28 +1150,31 @@ class VNCakeGUI:
 
         info = f"""Configuration Summary:
 
-📁 Paths:
+Platform: {platform.system()} {platform.release()}
+
+Paths:
    ISO Path: {self.config.get('iso_path')}
    noVNC Path: {self.config.get('novnc_path')}
+   QEMU Path: {self.config.get('qemu_path')}
+   Python Path: {self.config.get('python_path')}
    Database: {self.config.get('database')}
 
-🔧 Features:
+Features:
    CAPTCHA: {'Enabled' if self.config.get('enable_captcha') else 'Disabled'}
-   Tunneling: {'Enabled' if self.config.get(
-       'enable_tunneling') else 'Disabled'}
+   Tunneling: {'Enabled' if self.config.get('enable_tunneling') else 'Disabled'}
    Tunnel Provider: {self.config.get('tunnel_provider')}
    Tunnelify Available: {'Yes' if TUNNELIFY_AVAILABLE else 'No'}
 
-🖥️ VM Settings:
+VM Settings:
    Memory: {self.config.get('vm_memory')} MB
    CPUs: {self.config.get('vm_cpus')}
    Timeout: {self.config.get('vm_timeout')} seconds
 
-🌐 Network:
+Network:
    Port Range Start: {self.config.get('port_range_start')}
    VNC Port Range Start: {self.config.get('vnc_port_range_start')}
 
-📊 Server Status:
+Server Status:
    Status: {'Running' if self.manager else 'Stopped'}
    Active Users: {len(self.manager.user_vms) if self.manager else 0}
    Active VMs: {len(self.manager.user_vms) if self.manager else 0}
@@ -1275,13 +1212,7 @@ class VNCakeGUI:
     def update_subdomain_visibility(self):
         if self.tunnel_provider_var.get() == "localtunnel":
             for widget in self.subdomain_frame.winfo_children():
-                widget.pack(
-                    side=tk.LEFT,
-                    padx=(
-                        10,
-                        0) if widget != self.subdomain_frame.winfo_children()[0] else (
-                        0,
-                        0))
+                widget.pack(side=tk.LEFT, padx=(10, 0) if widget != self.subdomain_frame.winfo_children()[0] else (0, 0))
         else:
             for widget in self.subdomain_frame.winfo_children():
                 widget.pack_forget()
@@ -1292,8 +1223,7 @@ class VNCakeGUI:
 
     def on_closing(self):
         if self.manager:
-            if messagebox.askyesno("Quit",
-                                   "Server is running. Stop server and quit?"):
+            if messagebox.askyesno("Quit", "Server is running. Stop server and quit?"):
                 self.stop_server()
                 self.root.destroy()
         else:
@@ -1309,6 +1239,10 @@ def run_cli_mode(args):
         config.set('iso_path', args.iso_path)
     if args.novnc_path:
         config.set('novnc_path', args.novnc_path)
+    if args.qemu_path:
+        config.set('qemu_path', args.qemu_path)
+    if args.python_path:
+        config.set('python_path', args.python_path)
     if args.captcha is not None:
         config.set('enable_captcha', args.captcha)
     if args.tunneling is not None:
@@ -1338,39 +1272,38 @@ def run_cli_mode(args):
 
     config.save_config()
 
-    print(f"\n🔧 Configuration:")
+    print(f"\nConfiguration:")
+    print(f"   Platform: {platform.system()} {platform.release()}")
     print(f"   ISO Path: {config.get('iso_path')}")
     print(f"   noVNC Path: {config.get('novnc_path')}")
-    print(
-        f"   CAPTCHA: {
-            'Enabled' if config.get('enable_captcha') else 'Disabled'}")
-    print(
-        f"   Tunneling: {
-            'Enabled' if config.get('enable_tunneling') else 'Disabled'}")
+    print(f"   QEMU Path: {config.get('qemu_path')}")
+    print(f"   Python Path: {config.get('python_path')}")
+    print(f"   CAPTCHA: {'Enabled' if config.get('enable_captcha') else 'Disabled'}")
+    print(f"   Tunneling: {'Enabled' if config.get('enable_tunneling') else 'Disabled'}")
     print(f"   Tunnel Provider: {config.get('tunnel_provider')}")
-    if config.get('tunnel_provider') == 'localtunnel' and config.get(
-            'localtunnel_subdomain'):
-        print(
-            f"   Localtunnel Subdomain: {
-                config.get('localtunnel_subdomain')}")
+    if config.get('tunnel_provider') == 'localtunnel' and config.get('localtunnel_subdomain'):
+        print(f"   Localtunnel Subdomain: {config.get('localtunnel_subdomain')}")
     print(f"   VM Memory: {config.get('vm_memory')} MB")
     print(f"   VM CPUs: {config.get('vm_cpus')}")
     print(f"   Server: {host}:{port}")
 
     if not os.path.exists(config.get('iso_path')):
-        print(f"\n❌ Error: ISO file not found at {config.get('iso_path')}")
+        print(f"\nError: ISO file not found at {config.get('iso_path')}")
         return
 
     if not os.path.exists(config.get('novnc_path')):
-        print(
-            f"\n❌ Error: noVNC directory not found at {
-                config.get('novnc_path')}")
+        print(f"\nError: noVNC directory not found at {config.get('novnc_path')}")
+        return
+
+    qemu_path = config.get('qemu_path')
+    if not os.path.exists(qemu_path) and not shutil.which(qemu_path):
+        print(f"\nError: QEMU not found at {qemu_path}")
         return
 
     if config.get('enable_tunneling') and not TUNNELIFY_AVAILABLE:
-        print("\n⚠️  Warning: Tunneling enabled but tunnelify library not available")
+        print("\nWarning: Tunneling enabled but tunnelify library not available")
 
-    print(f"\n🚀 Starting VNCake server...")
+    print(f"\nStarting VNCake server...")
     print(f"   Web Interface: http://localhost:{port}")
     print(f"   Press Ctrl+C to stop\n")
 
@@ -1378,9 +1311,9 @@ def run_cli_mode(args):
     try:
         manager.run(host=host, port=port, debug=args.debug)
     except KeyboardInterrupt:
-        print("\n\n🛑 Shutting down VNCake...")
+        print("\n\nShutting down VNCake...")
         manager.cleanup_all_vms()
-        print("✅ VNCake stopped successfully!")
+        print("VNCake stopped successfully!")
 
 
 def main():
@@ -1390,74 +1323,34 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  vncake                                   # Launch GUI mode
-  vncake --cli                             # Launch CLI mode with defaults
-  vncake --cli --iso-path /path/to/os.iso  # CLI with custom ISO
-  vncake --cli --no-captcha --tunneling    # CLI without CAPTCHA, with tunneling
-  vncake --cli --memory 8192 --cpus 8      # CLI with custom VM specs
+  vncake
+  vncake --cli
+  vncake --cli --iso-path /path/to/os.iso
+  vncake --cli --qemu-path "C:\\Program Files\\qemu\\qemu-system-x86_64.exe"
+  vncake --cli --no-captcha --tunneling
+  vncake --cli --memory 8192 --cpus 8
 """
     )
 
-    parser.add_argument(
-        '--cli',
-        action='store_true',
-        help='Run in CLI mode (no GUI)')
+    parser.add_argument('--cli', action='store_true', help='Run in CLI mode')
     parser.add_argument('--iso-path', help='Path to ISO file')
-    parser.add_argument(
-        '--novnc-path',
-        default='noVNC',
-        help='Path to noVNC directory (default: noVNC)')
-    parser.add_argument(
-        '--captcha',
-        action='store_true',
-        help='Enable CAPTCHA')
-    parser.add_argument(
-        '--no-captcha',
-        dest='captcha',
-        action='store_false',
-        help='Disable CAPTCHA')
-    parser.add_argument(
-        '--tunneling',
-        action='store_true',
-        help='Enable Cloudflare tunneling')
-    parser.add_argument(
-        '--no-tunneling',
-        dest='tunneling',
-        action='store_false',
-        help='Disable tunneling')
-    parser.add_argument(
-        '--tunnel-provider',
-        choices=[
-            'cloudflare',
-            'localtunnel'],
-        help='Tunnel provider (cloudflare or localtunnel)')
-    parser.add_argument(
-        '--localtunnel-subdomain',
-        help='Custom subdomain for localtunnel')
-    parser.add_argument('--memory', help='VM memory in MB (default: 4096)')
-    parser.add_argument('--cpus', help='VM CPU count (default: 4)')
-    parser.add_argument(
-        '--timeout',
-        type=int,
-        help='VM timeout in seconds (default: 1800)')
-    parser.add_argument(
-        '--port-start',
-        type=int,
-        help='VNC port range start (default: 5900)')
-    parser.add_argument(
-        '--vnc-port-start',
-        type=int,
-        help='noVNC port range start (default: 6080)')
-    parser.add_argument(
-        '--host',
-        default='0.0.0.0',
-        help='Server host (default: 0.0.0.0)')
-    parser.add_argument('--port', type=int, default=5000,
-                        help='Server port (default: 5000)')
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='Enable debug mode')
+    parser.add_argument('--novnc-path', default='noVNC', help='Path to noVNC directory')
+    parser.add_argument('--qemu-path', help='Path to QEMU executable')
+    parser.add_argument('--python-path', help='Path to Python executable')
+    parser.add_argument('--captcha', action='store_true', help='Enable CAPTCHA')
+    parser.add_argument('--no-captcha', dest='captcha', action='store_false', help='Disable CAPTCHA')
+    parser.add_argument('--tunneling', action='store_true', help='Enable tunneling')
+    parser.add_argument('--no-tunneling', dest='tunneling', action='store_false', help='Disable tunneling')
+    parser.add_argument('--tunnel-provider', choices=['cloudflare', 'localtunnel'], help='Tunnel provider')
+    parser.add_argument('--localtunnel-subdomain', help='Custom subdomain for localtunnel')
+    parser.add_argument('--memory', help='VM memory in MB')
+    parser.add_argument('--cpus', help='VM CPU count')
+    parser.add_argument('--timeout', type=int, help='VM timeout in seconds')
+    parser.add_argument('--port-start', type=int, help='VNC port range start')
+    parser.add_argument('--vnc-port-start', type=int, help='noVNC port range start')
+    parser.add_argument('--host', default='0.0.0.0', help='Server host')
+    parser.add_argument('--port', type=int, default=5000, help='Server port')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
 
     parser.set_defaults(captcha=None, tunneling=None)
 

@@ -335,16 +335,19 @@ class VNCakeManager:
             qemu_path,
             '-m', self.config.get('vm_memory'),
             '-smp', self.config.get('vm_cpus'),
-            '-enable-kvm' if not IS_WINDOWS else '-accel', 'whpx' if not IS_WINDOWS else 'tcg',
             '-cdrom', self.config.get('iso_path'),
             '-boot', 'd',
             '-vga', 'std',
-            '-vnc', f'127.0.0.1:{vnc_port - self.config.get("port_range_start")}',
+            '-vnc', f'127.0.0.1:{vnc_port - self.config.get("port_range_start")},password=off',
             '-name', f'VNCake-User{user_id}'
         ]
 
         if IS_WINDOWS:
-            qemu_cmd = [cmd for cmd in qemu_cmd if cmd != '-enable-kvm']
+            qemu_cmd.extend(['-accel', 'whpx'])
+        elif IS_MACOS:
+            qemu_cmd.extend(['-accel', 'hvf'])
+        else:
+            qemu_cmd.append('-enable-kvm')
 
         try:
             qemu_proc = subprocess.Popen(
